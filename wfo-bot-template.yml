@@ -1,0 +1,412 @@
+# TEMPLATE FILE — NOT a real, runnable workflow on its own.
+# See bot-template.yml for the full substitution-scheme explanation;
+# it applies identically here.
+#
+# WFO bots always get their OWN dedicated workflow (never the
+# 15-per-batch shared pool — see FLEET-BATCHING ARCHITECTURE: WFO's
+# heavier ~20-file-per-bot footprint was explicitly why it was never
+# folded into the batch design). Meta-Site writes the substituted
+# result to .github/workflows/wfobot-{{BOT_NAME}}.yml.
+#
+# Tokens used in this template:
+#   {{BOT_NAME}}            — the WFO bot's unique name
+#   {{PRIVATE_REPO_NAME}}   — the private repo name
+#   {{STATE_ARTIFACT_NAME}} — name of the most-recent-state-snapshot
+#                              upload-artifact for this bot, produced
+#                              by this same workflow's prior run
+#   {{CONFIG_REFERENCE}}    — the bot's config reference, as recorded
+#                              in control.json at creation time
+#
+# Unlike a Live Bot, a WFO bot has no FreqUI to serve, so it attaches
+# no Cloudflare Quick Tunnel. Its state is a whole directory (the
+# ~20-file WFO working tree — walk-forward windows, hyperopt results,
+# intermediate artifacts) rather than a single tradesv3.sqlite, so
+# the DB-artifact-with-snapshot-fallback pattern from bot-template.yml
+# is generalized here to a tar.gz of that directory, restored and
+# saved through the identical two-tier chain (workflow artifact
+# first, private-repo base64 snapshot as fallback). The primer/
+# handoff mechanism itself (instance ID, stale-primer detection,
+# ready/go_sent handshake, separate concurrency groups, budget
+# tracking, schedule-next-run's three restart-authority checks) is
+# copied verbatim from the Live Bot pattern — this is the one
+# mechanism in the whole system that must never drift between bot
+# types.
+
+name: WFOBot - {{BOT_NAME}}
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [restart-wfobot-{{BOT_NAME}}, prime-wfobot-{{BOT_NAME}}]
+
+concurrency:
+  group: ${{ github.event.action == 'prime-wfobot-{{BOT_NAME}}' && 'wfobot-{{BOT_NAME}}-primer' || 'wfobot-{{BOT_NAME}}' }}
+  cancel-in-progress: true
+
+jobs:
+  run-wfo-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: write
+      actions: write
+    env:
+      META_BOT_GITHUB_PAT: ${{ secrets.META_BOT_GITHUB_PAT }}
+      GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+      PRIVATE_REPO: {{PRIVATE_REPO_NAME}}
+      BOT_NAME: {{BOT_NAME}}
+      BOT_DIR: user_data/wfo_bots/{{BOT_NAME}}
+      WORKING_DIR: ${{ github.workspace }}/private/freqtrade-core
+      BOT_DIR_REPO_PATH: freqtrade-core/user_data/wfo_bots/{{BOT_NAME}}
+      HANDOFF_FILE_PATH: user_data/wfo_bots/{{BOT_NAME}}/handoff.json
+      HANDOFF_MODE: ${{ github.event.action == 'prime-wfobot-{{BOT_NAME}}' && 'primer' || 'normal' }}
+      CONFIG_REFERENCE: {{CONFIG_REFERENCE}}
+    steps:
+      - name: Checkout public repo
+        uses: actions/checkout@v4
+
+      - name: Clone private repo
+        run: |
+          git clone "https://x-access-token:${META_BOT_GITHUB_PAT}@github.com/${GITHUB_REPOSITORY_OWNER}/${PRIVATE_REPO}.git" private
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          cd "${WORKING_DIR}"
+          python3 -m pip install --upgrade pip
+          if [ -f "${BOT_DIR}/requirements.txt" ]; then
+            pip install -r "${BOT_DIR}/requirements.txt"
+          elif [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install "freqtrade[hyperopt]" scipy numba bottleneck scikit-learn statsmodels requests
+          fi
+          pip install requests
+
+      - name: Download state artifact
+        id: state_artifact
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: {{STATE_ARTIFACT_NAME}}
+          path: /tmp/wfo_state_restore
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ github.run_id }}
+
+      - name: Restore state directory
+        run: |
+          BOT_ABS_DIR="${WORKING_DIR}/${BOT_DIR}"
+          mkdir -p "$BOT_ABS_DIR"
+
+          if [ -f "/tmp/wfo_state_restore/state_snapshot.tar.gz" ]; then
+            tar -xzf "/tmp/wfo_state_restore/state_snapshot.tar.gz" -C "$BOT_ABS_DIR"
+            echo "State restored from workflow artifact."
+          else
+            SNAPSHOT_HTTP=$(curl -s -o /tmp/wfo_snapshot_resp.json -w "%{http_code}" \
+              -H "Authorization: token ${META_BOT_GITHUB_PAT}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY_OWNER}/${PRIVATE_REPO}/contents/${BOT_DIR_REPO_PATH}/state_snapshot.tar.gz.b64")
+            if [ "$SNAPSHOT_HTTP" = "200" ]; then
+              python3 -c "
+          import json, base64
+          with open('/tmp/wfo_snapshot_resp.json') as f:
+              d = json.load(f)
+          content_b64_of_b64 = d['content'].replace('\n', '')
+          inner_b64 = base64.b64decode(content_b64_of_b64)
+          decoded = base64.b64decode(inner_b64)
+          with open('/tmp/wfo_state_snapshot.tar.gz', 'wb') as out:
+              out.write(decoded)
+          "
+              tar -xzf /tmp/wfo_state_snapshot.tar.gz -C "$BOT_ABS_DIR"
+              echo "State restored from private-repo snapshot fallback."
+            else
+              echo "No state artifact and no snapshot found -- starting with a fresh working directory."
+            fi
+          fi
+
+      - name: Primer mode — wait for go signal
+        if: env.HANDOFF_MODE == 'primer'
+        id: primer_mode
+        run: |
+          gh_get_handoff() {
+            curl -s -H "Authorization: token ${META_BOT_GITHUB_PAT}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY_OWNER}/${PRIVATE_REPO}/contents/${HANDOFF_FILE_PATH}"
+          }
+
+          gh_put_handoff() {
+            local content_b64="$1"
+            local message="$2"
+            for attempt in 1 2 3; do
+              sha=$(gh_get_handoff | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("sha","") if isinstance(d,dict) else "")' 2>/dev/null || echo "")
+              if [ -n "$sha" ]; then
+                body=$(python3 -c "import json,sys; print(json.dumps({'message': sys.argv[1], 'content': sys.argv[2], 'sha': sys.argv[3]}))" "$message" "$content_b64" "$sha")
+              else
+                body=$(python3 -c "import json,sys; print(json.dumps({'message': sys.argv[1], 'content': sys.argv[2]}))" "$message" "$content_b64")
+              fi
+              http_code=$(curl -s -o /tmp/gh_put_resp.json -w "%{http_code}" \
+                -X PUT -H "Authorization: token ${META_BOT_GITHUB_PAT}" \
+                -H "Accept: application/vnd.github.v3+json" \
+                "https://api.github.com/repos/${GITHUB_REPOSITORY_OWNER}/${PRIVATE_REPO}/contents/${HANDOFF_FILE_PATH}" \
+                -d "$body")
+              if [ "$http_code" = "200" ] || [ "$http_code" = "201" ]; then
+                return 0
+              fi
+              sleep $((attempt * 2))
+            done
+            echo "::warning::gh_put_handoff failed after 3 attempts (http=$http_code) -- falls back to normal budget-exhaustion restart."
+            return 1
+          }
+
+          read_handoff_field() {
+            gh_get_handoff | python3 -c "import sys,json,base64; d=json.load(sys.stdin); h=json.loads(base64.b64decode(d['content']).decode()); print(h.get('$1','') or '')" 2>/dev/null || echo ""
+          }
+
+          write_handoff_json() {
+            local b64
+            b64=$(printf '%s' "$1" | base64 -w0)
+            gh_put_handoff "$b64" "handoff: update"
+          }
+
+          THIS_INSTANCE_ID="$(python3 -c 'import uuid; print(uuid.uuid4().hex[:12])')"
+
+          existing_primer_id=$(read_handoff_field primer_instance_id)
+          existing_phase=$(read_handoff_field phase)
+          if [ -n "$existing_primer_id" ] && [ "$existing_primer_id" != "$THIS_INSTANCE_ID" ] && [ "$existing_phase" != "idle" ] && [ -n "$existing_phase" ]; then
+            echo "Handoff slot already claimed by ${existing_primer_id} (phase=${existing_phase}) -- this primer is stale, exiting without serving."
+            echo "got_go=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          write_handoff_json "{\"phase\": \"ready\", \"primer_instance_id\": \"${THIS_INSTANCE_ID}\", \"go_ts\": null}"
+          echo "Primer ready (${THIS_INSTANCE_ID}) -- waiting for go signal..."
+
+          DEADLINE=$(( $(date +%s) + 20*60 ))
+          GOT_GO="false"
+          while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+            sleep 5
+            cur_phase=$(read_handoff_field phase)
+            cur_primer=$(read_handoff_field primer_instance_id)
+            if [ "$cur_phase" = "go_sent" ] && [ "$cur_primer" = "$THIS_INSTANCE_ID" ]; then
+              echo "Go signal confirmed for ${THIS_INSTANCE_ID} -- taking over."
+              GOT_GO="true"
+              write_handoff_json "{\"phase\": \"idle\", \"primer_instance_id\": null, \"go_ts\": null}"
+              break
+            fi
+            if [ "$cur_phase" = "idle" ]; then
+              echo "Handoff slot was reset by the outgoing process -- abandoning."
+              break
+            fi
+          done
+
+          if [ "$GOT_GO" != "true" ]; then
+            echo "No go signal within timeout -- giving up. Outgoing process's own budget-exhaustion fallback covers continuity."
+          fi
+
+          echo "got_go=${GOT_GO}" >> "$GITHUB_OUTPUT"
+
+      - name: Run WFO bot with handoff loop
+        if: env.HANDOFF_MODE != 'primer' || steps.primer_mode.outputs.got_go == 'true'
+        id: run_bot
+        run: |
+          gh_get_handoff() {
+            curl -s -H "Authorization: token ${META_BOT_GITHUB_PAT}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY_OWNER}/${PRIVATE_REPO}/contents/${HANDOFF_FILE_PATH}"
+          }
+
+          gh_put_handoff() {
+            local content_b64="$1"
+            local message="$2"
+            for attempt in 1 2 3; do
+              sha=$(gh_get_handoff | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("sha","") if isinstance(d,dict) else "")' 2>/dev/null || echo "")
+              if [ -n "$sha" ]; then
+                body=$(python3 -c "import json,sys; print(json.dumps({'message': sys.argv[1], 'content': sys.argv[2], 'sha': sys.argv[3]}))" "$message" "$content_b64" "$sha")
+              else
+                body=$(python3 -c "import json,sys; print(json.dumps({'message': sys.argv[1], 'content': sys.argv[2]}))" "$message" "$content_b64")
+              fi
+              http_code=$(curl -s -o /tmp/gh_put_resp.json -w "%{http_code}" \
+                -X PUT -H "Authorization: token ${META_BOT_GITHUB_PAT}" \
+                -H "Accept: application/vnd.github.v3+json" \
+                "https://api.github.com/repos/${GITHUB_REPOSITORY_OWNER}/${PRIVATE_REPO}/contents/${HANDOFF_FILE_PATH}" \
+                -d "$body")
+              if [ "$http_code" = "200" ] || [ "$http_code" = "201" ]; then
+                return 0
+              fi
+              sleep $((attempt * 2))
+            done
+            echo "::warning::gh_put_handoff failed after 3 attempts (http=$http_code) -- falls back to normal budget-exhaustion restart."
+            return 1
+          }
+
+          read_handoff_field() {
+            gh_get_handoff | python3 -c "import sys,json,base64; d=json.load(sys.stdin); h=json.loads(base64.b64decode(d['content']).decode()); print(h.get('$1','') or '')" 2>/dev/null || echo ""
+          }
+
+          write_handoff_json() {
+            local b64
+            b64=$(printf '%s' "$1" | base64 -w0)
+            gh_put_handoff "$b64" "handoff: update"
+          }
+
+          BOT_ABS_DIR="${WORKING_DIR}/${BOT_DIR}"
+          LAUNCH_CREDENTIALS_UPDATED_AT=$(python3 -c "
+          import json
+          try:
+              with open('${BOT_ABS_DIR}/control.json') as f:
+                  print(json.load(f).get('credentials_updated_at') or '')
+          except FileNotFoundError:
+              print('')
+          " 2>/dev/null || echo "")
+
+          (cd "$BOT_ABS_DIR" && python3 wfo_bot.py --config-reference "${CONFIG_REFERENCE}") &
+          BOT_PID=$!
+
+          PROBE_TRACKED_PIDS="wfo:${BOT_PID}" \
+          PROBE_RUNNER_ID="wfo-{{BOT_NAME}}" \
+          PROBE_POOL="wfo" \
+          PROBE_STATUS_PATH="freqtrade-core/user_data/probes/wfo-{{BOT_NAME}}.json" \
+          META_BOT_GITHUB_PAT="${META_BOT_GITHUB_PAT}" \
+          META_BOT_GITHUB_OWNER="${GITHUB_REPOSITORY_OWNER}" \
+          META_BOT_PRIVATE_REPO_NAME="${PRIVATE_REPO}" \
+          nohup python3 "${WORKING_DIR}/scripts/ram_probe.py" loop > /tmp/ram_probe.log 2>&1 &
+          PROBE_PID=$!
+
+          STOP_AFTER_SECONDS=$((5*3600 + 50*60))
+          HANDOFF_MARGIN_SECONDS=$((15*60))
+          END_TIME=$(( $(date +%s) + STOP_AFTER_SECONDS ))
+          PRIMER_DISPATCHED="false"
+          EXIT_SENTINEL="normal"
+
+          while [ "$(date +%s)" -lt "$END_TIME" ]; do
+            sleep 300
+            if ! kill -0 "$BOT_PID" 2>/dev/null; then
+              echo "Bot process exited unexpectedly -- stopping early, will report crash detail."
+              break
+            fi
+
+            CUR_CREDENTIALS_UPDATED_AT=$(curl -s \
+              -H "Authorization: token ${META_BOT_GITHUB_PAT}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY_OWNER}/${PRIVATE_REPO}/contents/${BOT_DIR_REPO_PATH}/control.json" \
+              | python3 -c "import sys,json,base64; d=json.load(sys.stdin); print(json.loads(base64.b64decode(d['content']).decode()).get('credentials_updated_at') or '')" 2>/dev/null || echo "")
+
+            _time_left=$(( END_TIME - $(date +%s) ))
+            _credentials_changed="false"
+            if [ -n "$CUR_CREDENTIALS_UPDATED_AT" ] && [ "$CUR_CREDENTIALS_UPDATED_AT" != "$LAUNCH_CREDENTIALS_UPDATED_AT" ]; then
+              _credentials_changed="true"
+            fi
+
+            if [ "$PRIMER_DISPATCHED" = "false" ] && ( [ "$_time_left" -le "$HANDOFF_MARGIN_SECONDS" ] || [ "$_credentials_changed" = "true" ] ); then
+              PRIMER_DISPATCHED="true"
+              if [ "$_credentials_changed" = "true" ]; then
+                echo "credentials_updated_at changed (${LAUNCH_CREDENTIALS_UPDATED_AT} -> ${CUR_CREDENTIALS_UPDATED_AT}) -- requesting graceful handoff to pick up new credentials."
+              fi
+              cur_phase=$(read_handoff_field phase)
+              if [ -z "$cur_phase" ] || [ "$cur_phase" = "idle" ]; then
+                write_handoff_json "{\"phase\": \"priming\", \"primer_instance_id\": null, \"go_ts\": null}"
+                curl -s -X POST \
+                  -H "Authorization: token ${META_BOT_GITHUB_PAT}" \
+                  -H "Accept: application/vnd.github.v3+json" \
+                  "https://api.github.com/repos/${{ github.repository }}/dispatches" \
+                  -d "{\"event_type\":\"prime-wfobot-{{BOT_NAME}}\"}"
+                echo "Primer dispatched."
+              fi
+            fi
+
+            if [ "$PRIMER_DISPATCHED" = "true" ]; then
+              cur_phase=$(read_handoff_field phase)
+              cur_primer=$(read_handoff_field primer_instance_id)
+              if [ "$cur_phase" = "ready" ] && [ -n "$cur_primer" ]; then
+                echo "Primer ${cur_primer} is ready -- yielding now."
+                write_handoff_json "{\"phase\": \"go_sent\", \"primer_instance_id\": \"${cur_primer}\", \"go_ts\": true}"
+                EXIT_SENTINEL="handoff_yielded"
+                break
+              fi
+            fi
+          done
+
+          kill "$BOT_PID" 2>/dev/null || true
+          wait "$BOT_PID" 2>/dev/null || true
+          kill "$PROBE_PID" 2>/dev/null || true
+
+          echo "exit_sentinel=${EXIT_SENTINEL}" >> "$GITHUB_OUTPUT"
+
+      - name: Package state directory
+        if: always()
+        run: |
+          BOT_ABS_DIR="${WORKING_DIR}/${BOT_DIR}"
+          if [ -d "$BOT_ABS_DIR" ]; then
+            tar -czf /tmp/wfo_state_snapshot.tar.gz -C "$BOT_ABS_DIR" .
+          fi
+
+      - name: Upload state artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: {{STATE_ARTIFACT_NAME}}
+          path: /tmp/wfo_state_snapshot.tar.gz
+          retention-days: 7
+
+      - name: Write state snapshot fallback to private repo
+        if: always()
+        run: |
+          if [ -f /tmp/wfo_state_snapshot.tar.gz ]; then
+            B64=$(base64 -w0 /tmp/wfo_state_snapshot.tar.gz)
+            DOUBLE_B64=$(printf '%s' "$B64" | base64 -w0)
+            SHA=$(curl -s -H "Authorization: token ${META_BOT_GITHUB_PAT}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY_OWNER}/${PRIVATE_REPO}/contents/${BOT_DIR_REPO_PATH}/state_snapshot.tar.gz.b64" \
+              | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("sha","") if isinstance(d,dict) else "")' 2>/dev/null || echo "")
+            if [ -n "$SHA" ]; then
+              BODY=$(python3 -c "import json,sys; print(json.dumps({'message': 'wfo state snapshot: update', 'content': sys.argv[1], 'sha': sys.argv[2]}))" "$DOUBLE_B64" "$SHA")
+            else
+              BODY=$(python3 -c "import json,sys; print(json.dumps({'message': 'wfo state snapshot: create', 'content': sys.argv[1]}))" "$DOUBLE_B64")
+            fi
+            curl -s -X PUT \
+              -H "Authorization: token ${META_BOT_GITHUB_PAT}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY_OWNER}/${PRIVATE_REPO}/contents/${BOT_DIR_REPO_PATH}/state_snapshot.tar.gz.b64" \
+              -d "$BODY"
+          fi
+
+      - name: Schedule next run
+        if: always() && (env.HANDOFF_MODE != 'primer' || steps.primer_mode.outputs.got_go == 'true')
+        run: |
+          EXIT_SENTINEL="${{ steps.run_bot.outputs.exit_sentinel }}"
+          CONTROL_JSON_PATH="${WORKING_DIR}/${BOT_DIR}/control.json"
+
+          if [ "$EXIT_SENTINEL" = "handoff_yielded" ]; then
+            echo "Clean handoff detected -- successor is already live under the '-primer' concurrency group. Skipping self-dispatch entirely."
+            exit 0
+          fi
+
+          # Re-pull the private repo before reading control.json below --
+          # see bot-template.yml for the full rationale (stale local
+          # clone vs. Meta-Site's meta_restart/paused write on GitHub).
+          (
+            cd "${WORKING_DIR}/.." && \
+            source freqtrade-core/scripts/git_conflict_safety.sh && \
+            git_safe_pull_rebase
+          ) || echo "Warning: safe-pull before restart-authority check failed -- proceeding with local state as a best effort."
+
+          if [ -f "$CONTROL_JSON_PATH" ] && grep -q '"paused": *true' "$CONTROL_JSON_PATH"; then
+            echo "Bot is paused -- not scheduling next run."
+            exit 0
+          fi
+
+          if [ -f "$CONTROL_JSON_PATH" ] && grep -q '"meta_restart": *true' "$CONTROL_JSON_PATH"; then
+            echo "Meta-Site is handling this restart -- skipping self-dispatch."
+            exit 0
+          fi
+
+          echo "No claim found -- self-dispatching as fallback."
+          curl -s -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/${{ github.repository }}/dispatches \
+            -d '{"event_type":"restart-wfobot-{{BOT_NAME}}"}'

@@ -1,0 +1,596 @@
+# TEMPLATE FILE — NOT a real, runnable workflow on its own.
+#
+# This lives at the public-repo ROOT (not under .github/workflows/),
+# specifically so GitHub Actions never tries to parse it as a live
+# workflow. Meta-Site reads this file's content via the Contents
+# API, substitutes every double-curly-brace placeholder below with
+# real values at bot-creation time, and writes the RESULT into
+# .github/workflows/bot-<name>.yml — that written copy is the real,
+# runnable workflow.
+#
+# Substitution scheme (established in Pass 1, used by every template
+# in this repo): tokens are written in upper-snake-case wrapped in
+# double curly braces. Meta-Site's substitution step must replace
+# every token literally present in this file — an unresolved
+# placeholder left in the written output is a bug, not a valid
+# partial state, and the verified-write readback check (Pass 3) must
+# fail closed if any double-curly-brace pattern remains in the
+# substituted content before it's committed.
+#
+# Tokens used in this template:
+#   {{BOT_NAME}}        — the bot's unique name, used in job/group names and paths
+#   {{PRIVATE_REPO_NAME}} — the private repo name (defaults to Miadol per the spec)
+#
+# Passes 14-15 are where the primer/handoff protocol section gets
+# added on top of Pass 12's install + DB-restore body below.
+#
+# Additional tokens used from Pass 12 onward:
+#   {{DB_ARTIFACT_NAME}}   — name of the most-recent-DB-snapshot upload-artifact
+#                              for this bot, produced by this same workflow's
+#                              prior run
+#   {{STRATEGY_CLASS}}     — the bot's Freqtrade strategy class name, as
+#                              recorded in control.json at creation time
+#
+# Pass 28 tokens (config.json materialization — the workflow launches
+# Freqtrade against ${BOT_DIR}/config.json, which must be generated fresh
+# on every run from secrets.json + control.json before the process starts;
+# it is never committed to the repo itself, since it's a merge of two
+# sources that can each change independently via attach_telegram()/credential
+# editing):
+#   {{BASE_CONFIG_REPO_PATH}} — the bot's base_config JSON text (from
+#                                 control.json at creation time), inlined
+#                                 literally as a Python triple-quoted
+#                                 string body (already escaped against
+#                                 ''' collisions by the substitution
+#                                 engine). Empty string is valid (falls
+#                                 back to {}).
+#   {{DRY_RUN_JSON}}           — literal Python `True` or `False`,
+#                                 substituted directly into a Python
+#                                 assignment expression, not JSON syntax.
+#
+# Pass 28 also adds a config-reload path: the outgoing process's own
+# poll loop (below) reads control.json's credentials_updated_at on
+# every 300s tick and compares it against the value recorded when this
+# run's config.json was generated. A change triggers the exact same
+# primer-dispatch-and-yield path already used for budget-exhaustion
+# handoff -- never a hard kill and never a second mechanism -- so
+# credential edits and attach_telegram() take effect via a graceful
+# handoff rather than waiting for the next 5h50m cycle.
+#
+# Pass 14 adds the primer-mode block (instance ID, stale-primer
+# detection, ready/go_sent handshake) as its own gated step, running
+# only when this job was dispatched as a primer for this bot. Pass 15
+# wires the outgoing process's own main loop to dispatch that primer
+# and yield to it on the shared clock. Pass 16 adds the Cloudflare
+# Quick Tunnel attach/detach primitive: every run (primer or normal)
+# attaches its own tunnel and writes the resulting URL to
+# tunnel.json in the private repo before entering primer-mode/
+# run-loop, so a handoff always re-points tunnel.json to the new
+# process's tunnel before the outgoing process's own tunnel is torn
+# down in its Detach step.
+
+name: LiveBot - {{BOT_NAME}}
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [restart-bot-{{BOT_NAME}}, prime-bot-{{BOT_NAME}}]
+
+concurrency:
+  group: ${{ github.event.action == 'prime-bot-{{BOT_NAME}}' && 'bot-{{BOT_NAME}}-primer' || 'bot-{{BOT_NAME}}' }}
+  cancel-in-progress: true
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: write
+      actions: write
+    env:
+      META_BOT_GITHUB_PAT: ${{ secrets.META_BOT_GITHUB_PAT }}
+      GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+      PRIVATE_REPO: {{PRIVATE_REPO_NAME}}
+      BOT_NAME: {{BOT_NAME}}
+      BOT_DIR: user_data/live_bots/{{BOT_NAME}}
+      WORKING_DIR: ${{ github.workspace }}/private/freqtrade-core
+      BOT_DIR_REPO_PATH: freqtrade-core/user_data/live_bots/{{BOT_NAME}}
+      HANDOFF_FILE_PATH: user_data/live_bots/{{BOT_NAME}}/handoff.json
+      HANDOFF_MODE: ${{ github.event.action == 'prime-bot-{{BOT_NAME}}' && 'primer' || 'normal' }}
+      TUNNEL_STATUS_REPO_PATH: freqtrade-core/user_data/live_bots/{{BOT_NAME}}/tunnel.json
+    steps:
+      - name: Checkout public repo
+        uses: actions/checkout@v4
+
+      - name: Clone private repo
+        run: |
+          git clone "https://x-access-token:${META_BOT_GITHUB_PAT}@github.com/${GITHUB_REPOSITORY_OWNER}/${PRIVATE_REPO}.git" private
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Freqtrade
+        run: |
+          cd "${WORKING_DIR}"
+          python3 -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install freqtrade
+          fi
+          pip install requests
+
+      - name: Download DB artifact
+        id: db_artifact
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: {{DB_ARTIFACT_NAME}}
+          path: /tmp/db_artifact_restore
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ github.run_id }}
+
+      - name: Restore DB state
+        run: |
+          BOT_DB_PATH="${WORKING_DIR}/${BOT_DIR}/tradesv3.sqlite"
+          mkdir -p "$(dirname "$BOT_DB_PATH")"
+
+          if [ -f "/tmp/db_artifact_restore/tradesv3.sqlite" ]; then
+            cp "/tmp/db_artifact_restore/tradesv3.sqlite" "$BOT_DB_PATH"
+            echo "DB restored from workflow artifact."
+          else
+            SNAPSHOT_HTTP=$(curl -s -o /tmp/db_snapshot_resp.json -w "%{http_code}" \
+              -H "Authorization: token ${META_BOT_GITHUB_PAT}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY_OWNER}/${PRIVATE_REPO}/contents/${BOT_DIR_REPO_PATH}/db_snapshot.sqlite.b64")
+            if [ "$SNAPSHOT_HTTP" = "200" ]; then
+              python3 -c "
+          import json, base64
+          with open('/tmp/db_snapshot_resp.json') as f:
+              d = json.load(f)
+          content_b64_of_b64 = d['content'].replace('\n', '')
+          inner_b64 = base64.b64decode(content_b64_of_b64)
+          decoded = base64.b64decode(inner_b64)
+          with open('${BOT_DB_PATH}', 'wb') as out:
+              out.write(decoded)
+          "
+              echo "DB restored from private-repo snapshot fallback."
+            else
+              echo "No DB artifact and no snapshot found -- starting with a fresh DB."
+            fi
+          fi
+
+      - name: Generate config.json
+        run: |
+          BOT_CONFIG_PATH="${WORKING_DIR}/${BOT_DIR}/config.json"
+          mkdir -p "$(dirname "$BOT_CONFIG_PATH")"
+
+          SECRETS_HTTP=$(curl -s -o /tmp/secrets_resp.json -w "%{http_code}" \
+            -H "Authorization: token ${META_BOT_GITHUB_PAT}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY_OWNER}/${PRIVATE_REPO}/contents/${BOT_DIR_REPO_PATH}/secrets.json")
+          if [ "$SECRETS_HTTP" != "200" ]; then
+            echo "::error::secrets.json not found for {{BOT_NAME}} (http=$SECRETS_HTTP) -- cannot generate config.json, bot cannot start."
+            exit 1
+          fi
+          python3 -c "
+          import json, base64
+          with open('/tmp/secrets_resp.json') as f:
+              d = json.load(f)
+          content_b64 = d['content'].replace('\n', '')
+          decoded = base64.b64decode(content_b64)
+          with open('/tmp/secrets.json', 'wb') as out:
+              out.write(decoded)
+          "
+
+          CONTROL_HTTP=$(curl -s -o /tmp/control_resp.json -w "%{http_code}" \
+            -H "Authorization: token ${META_BOT_GITHUB_PAT}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY_OWNER}/${PRIVATE_REPO}/contents/${BOT_DIR_REPO_PATH}/control.json")
+          if [ "$CONTROL_HTTP" = "200" ]; then
+            python3 -c "
+          import json, base64
+          with open('/tmp/control_resp.json') as f:
+              d = json.load(f)
+          content_b64 = d['content'].replace('\n', '')
+          decoded = base64.b64decode(content_b64)
+          with open('/tmp/control.json', 'wb') as out:
+              out.write(decoded)
+          "
+          else
+            echo '{}' > /tmp/control.json
+          fi
+
+          python3 -c "
+          import json
+
+          with open('/tmp/secrets.json') as f:
+              secrets = json.load(f)
+
+          base_config_text = '''{{BASE_CONFIG_REPO_PATH}}'''
+          try:
+              config = json.loads(base_config_text) if base_config_text.strip() else {}
+          except json.JSONDecodeError:
+              config = {}
+
+          config['dry_run'] = {{DRY_RUN_JSON}}
+          config['exchange'] = config.get('exchange', {})
+          config['exchange']['key'] = secrets.get('exchange_api_key', '')
+          config['exchange']['secret'] = secrets.get('exchange_api_secret', '')
+
+          config['api_server'] = config.get('api_server', {})
+          config['api_server']['enabled'] = True
+          config['api_server']['listen_ip_address'] = '127.0.0.1'
+          config['api_server']['listen_port'] = 8080
+          config['api_server']['username'] = secrets.get('freq_ui_username', '')
+          config['api_server']['password'] = secrets.get('freq_ui_password', '')
+          config['api_server']['jwt_secret_key'] = secrets.get('freq_ui_password', '')
+
+          telegram_token = secrets.get('telegram_token')
+          telegram_chat_id = secrets.get('telegram_chat_id')
+          if telegram_token and telegram_chat_id:
+              config['telegram'] = {
+                  'enabled': True,
+                  'token': telegram_token,
+                  'chat_id': telegram_chat_id,
+              }
+          else:
+              config['telegram'] = {'enabled': False, 'token': '', 'chat_id': ''}
+
+          with open('${BOT_CONFIG_PATH}', 'w') as out:
+              json.dump(config, out, indent=2)
+          "
+          echo "config.json generated for {{BOT_NAME}} (dry_run={{DRY_RUN_JSON}}, telegram=$(python3 -c "import json; print(json.load(open('${BOT_CONFIG_PATH}'))['telegram']['enabled'])"))."
+
+          LAUNCH_CREDENTIALS_UPDATED_AT=$(python3 -c "
+          import json
+          with open('/tmp/control.json') as f:
+              print(json.load(f).get('credentials_updated_at') or '')
+          " 2>/dev/null || echo "")
+          echo "LAUNCH_CREDENTIALS_UPDATED_AT=${LAUNCH_CREDENTIALS_UPDATED_AT}" >> "$GITHUB_ENV"
+
+      - name: Install cloudflared
+        run: |
+          curl -sL --output /tmp/cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i /tmp/cloudflared.deb
+
+      - name: Attach Cloudflare Quick Tunnel
+        id: tunnel_attach
+        run: |
+          FREQUI_PORT=8080
+          nohup cloudflared tunnel --url "http://localhost:${FREQUI_PORT}" > /tmp/cloudflared.log 2>&1 &
+          echo $! > /tmp/cloudflared.pid
+
+          TUNNEL_URL=""
+          for attempt in $(seq 1 20); do
+            sleep 3
+            TUNNEL_URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' /tmp/cloudflared.log | head -n1 || true)
+            if [ -n "$TUNNEL_URL" ]; then
+              break
+            fi
+          done
+
+          if [ -z "$TUNNEL_URL" ]; then
+            echo "::warning::cloudflared did not report a tunnel URL within timeout -- FreqUI will be unreachable this cycle."
+            echo "tunnel_url=" >> "$GITHUB_OUTPUT"
+          else
+            echo "Tunnel attached: ${TUNNEL_URL}"
+            echo "tunnel_url=${TUNNEL_URL}" >> "$GITHUB_OUTPUT"
+            TUNNEL_BODY=$(python3 -c "import json,sys; print(json.dumps({'tunnel_url': sys.argv[1], 'bot_name': sys.argv[2]}))" "$TUNNEL_URL" "$BOT_NAME")
+            TUNNEL_B64=$(printf '%s' "$TUNNEL_BODY" | base64 -w0)
+            TUNNEL_SHA=$(curl -s -H "Authorization: token ${META_BOT_GITHUB_PAT}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY_OWNER}/${PRIVATE_REPO}/contents/${TUNNEL_STATUS_REPO_PATH}" \
+              | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("sha","") if isinstance(d,dict) else "")' 2>/dev/null || echo "")
+            if [ -n "$TUNNEL_SHA" ]; then
+              PUT_BODY=$(python3 -c "import json,sys; print(json.dumps({'message': 'tunnel: attach', 'content': sys.argv[1], 'sha': sys.argv[2]}))" "$TUNNEL_B64" "$TUNNEL_SHA")
+            else
+              PUT_BODY=$(python3 -c "import json,sys; print(json.dumps({'message': 'tunnel: attach', 'content': sys.argv[1]}))" "$TUNNEL_B64")
+            fi
+            curl -s -X PUT \
+              -H "Authorization: token ${META_BOT_GITHUB_PAT}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY_OWNER}/${PRIVATE_REPO}/contents/${TUNNEL_STATUS_REPO_PATH}" \
+              -d "$PUT_BODY"
+          fi
+
+      - name: Primer mode — wait for go signal
+        if: env.HANDOFF_MODE == 'primer'
+        id: primer_mode
+        run: |
+          gh_get_handoff() {
+            curl -s -H "Authorization: token ${META_BOT_GITHUB_PAT}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY_OWNER}/${PRIVATE_REPO}/contents/${HANDOFF_FILE_PATH}"
+          }
+
+          gh_put_handoff() {
+            local content_b64="$1"
+            local message="$2"
+            for attempt in 1 2 3; do
+              sha=$(gh_get_handoff | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("sha","") if isinstance(d,dict) else "")' 2>/dev/null || echo "")
+              if [ -n "$sha" ]; then
+                body=$(python3 -c "import json,sys; print(json.dumps({'message': sys.argv[1], 'content': sys.argv[2], 'sha': sys.argv[3]}))" "$message" "$content_b64" "$sha")
+              else
+                body=$(python3 -c "import json,sys; print(json.dumps({'message': sys.argv[1], 'content': sys.argv[2]}))" "$message" "$content_b64")
+              fi
+              http_code=$(curl -s -o /tmp/gh_put_resp.json -w "%{http_code}" \
+                -X PUT -H "Authorization: token ${META_BOT_GITHUB_PAT}" \
+                -H "Accept: application/vnd.github.v3+json" \
+                "https://api.github.com/repos/${GITHUB_REPOSITORY_OWNER}/${PRIVATE_REPO}/contents/${HANDOFF_FILE_PATH}" \
+                -d "$body")
+              if [ "$http_code" = "200" ] || [ "$http_code" = "201" ]; then
+                return 0
+              fi
+              sleep $((attempt * 2))
+            done
+            echo "::warning::gh_put_handoff failed after 3 attempts (http=$http_code) -- falls back to normal budget-exhaustion restart."
+            return 1
+          }
+
+          read_handoff_field() {
+            gh_get_handoff | python3 -c "import sys,json,base64; d=json.load(sys.stdin); h=json.loads(base64.b64decode(d['content']).decode()); print(h.get('$1','') or '')" 2>/dev/null || echo ""
+          }
+
+          write_handoff_json() {
+            local b64
+            b64=$(printf '%s' "$1" | base64 -w0)
+            gh_put_handoff "$b64" "handoff: update"
+          }
+
+          THIS_INSTANCE_ID="$(python3 -c 'import uuid; print(uuid.uuid4().hex[:12])')"
+
+          existing_primer_id=$(read_handoff_field primer_instance_id)
+          existing_phase=$(read_handoff_field phase)
+          if [ -n "$existing_primer_id" ] && [ "$existing_primer_id" != "$THIS_INSTANCE_ID" ] && [ "$existing_phase" != "idle" ] && [ -n "$existing_phase" ]; then
+            echo "Handoff slot already claimed by ${existing_primer_id} (phase=${existing_phase}) -- this primer is stale, exiting without serving."
+            echo "got_go=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          write_handoff_json "{\"phase\": \"ready\", \"primer_instance_id\": \"${THIS_INSTANCE_ID}\", \"go_ts\": null}"
+          echo "Primer ready (${THIS_INSTANCE_ID}) -- waiting for go signal..."
+
+          DEADLINE=$(( $(date +%s) + 20*60 ))
+          GOT_GO="false"
+          while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+            sleep 5
+            cur_phase=$(read_handoff_field phase)
+            cur_primer=$(read_handoff_field primer_instance_id)
+            if [ "$cur_phase" = "go_sent" ] && [ "$cur_primer" = "$THIS_INSTANCE_ID" ]; then
+              echo "Go signal confirmed for ${THIS_INSTANCE_ID} -- taking over."
+              GOT_GO="true"
+              write_handoff_json "{\"phase\": \"idle\", \"primer_instance_id\": null, \"go_ts\": null}"
+              break
+            fi
+            if [ "$cur_phase" = "idle" ]; then
+              echo "Handoff slot was reset by the outgoing process -- abandoning."
+              break
+            fi
+          done
+
+          if [ "$GOT_GO" != "true" ]; then
+            echo "No go signal within timeout -- giving up. Outgoing process's own budget-exhaustion fallback covers continuity."
+          fi
+
+          echo "got_go=${GOT_GO}" >> "$GITHUB_OUTPUT"
+
+      - name: Run bot with handoff loop
+        if: env.HANDOFF_MODE != 'primer' || steps.primer_mode.outputs.got_go == 'true'
+        id: run_bot
+        run: |
+          gh_get_handoff() {
+            curl -s -H "Authorization: token ${META_BOT_GITHUB_PAT}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY_OWNER}/${PRIVATE_REPO}/contents/${HANDOFF_FILE_PATH}"
+          }
+
+          gh_put_handoff() {
+            local content_b64="$1"
+            local message="$2"
+            for attempt in 1 2 3; do
+              sha=$(gh_get_handoff | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("sha","") if isinstance(d,dict) else "")' 2>/dev/null || echo "")
+              if [ -n "$sha" ]; then
+                body=$(python3 -c "import json,sys; print(json.dumps({'message': sys.argv[1], 'content': sys.argv[2], 'sha': sys.argv[3]}))" "$message" "$content_b64" "$sha")
+              else
+                body=$(python3 -c "import json,sys; print(json.dumps({'message': sys.argv[1], 'content': sys.argv[2]}))" "$message" "$content_b64")
+              fi
+              http_code=$(curl -s -o /tmp/gh_put_resp.json -w "%{http_code}" \
+                -X PUT -H "Authorization: token ${META_BOT_GITHUB_PAT}" \
+                -H "Accept: application/vnd.github.v3+json" \
+                "https://api.github.com/repos/${GITHUB_REPOSITORY_OWNER}/${PRIVATE_REPO}/contents/${HANDOFF_FILE_PATH}" \
+                -d "$body")
+              if [ "$http_code" = "200" ] || [ "$http_code" = "201" ]; then
+                return 0
+              fi
+              sleep $((attempt * 2))
+            done
+            echo "::warning::gh_put_handoff failed after 3 attempts (http=$http_code) -- falls back to normal budget-exhaustion restart."
+            return 1
+          }
+
+          read_handoff_field() {
+            gh_get_handoff | python3 -c "import sys,json,base64; d=json.load(sys.stdin); h=json.loads(base64.b64decode(d['content']).decode()); print(h.get('$1','') or '')" 2>/dev/null || echo ""
+          }
+
+          write_handoff_json() {
+            local b64
+            b64=$(printf '%s' "$1" | base64 -w0)
+            gh_put_handoff "$b64" "handoff: update"
+          }
+
+          (cd "${WORKING_DIR}" && python3 -m freqtrade trade \
+            --config "${BOT_DIR}/config.json" \
+            --db-url "sqlite:///${BOT_DIR}/tradesv3.sqlite" \
+            --strategy {{STRATEGY_CLASS}}) &
+          BOT_PID=$!
+
+          PROBE_TRACKED_PIDS="freqtrade:${BOT_PID}" \
+          PROBE_RUNNER_ID="live-{{BOT_NAME}}" \
+          PROBE_POOL="live" \
+          PROBE_STATUS_PATH="freqtrade-core/user_data/probes/live-{{BOT_NAME}}.json" \
+          META_BOT_GITHUB_PAT="${META_BOT_GITHUB_PAT}" \
+          META_BOT_GITHUB_OWNER="${GITHUB_REPOSITORY_OWNER}" \
+          META_BOT_PRIVATE_REPO_NAME="${PRIVATE_REPO}" \
+          nohup python3 "${WORKING_DIR}/scripts/ram_probe.py" loop > /tmp/ram_probe.log 2>&1 &
+          PROBE_PID=$!
+
+          STOP_AFTER_SECONDS=$((5*3600 + 50*60))
+          HANDOFF_MARGIN_SECONDS=$((15*60))
+          END_TIME=$(( $(date +%s) + STOP_AFTER_SECONDS ))
+          PRIMER_DISPATCHED="false"
+          EXIT_SENTINEL="normal"
+
+          while [ "$(date +%s)" -lt "$END_TIME" ]; do
+            sleep 300
+            if ! kill -0 "$BOT_PID" 2>/dev/null; then
+              echo "Bot process exited unexpectedly -- stopping early, will report crash detail."
+              break
+            fi
+
+            curl -s \
+              -H "Authorization: token ${META_BOT_GITHUB_PAT}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY_OWNER}/${PRIVATE_REPO}/contents/${BOT_DIR_REPO_PATH}/control.json" \
+              > /tmp/control_poll.json 2>/dev/null || echo '{}' > /tmp/control_poll.json
+
+            CUR_CREDENTIALS_UPDATED_AT=$(python3 -c "import sys,json,base64; d=json.load(open('/tmp/control_poll.json')); print(json.loads(base64.b64decode(d['content']).decode()).get('credentials_updated_at') or '')" 2>/dev/null || echo "")
+            CUR_STOP_REQUESTED=$(python3 -c "import sys,json,base64; d=json.load(open('/tmp/control_poll.json')); print('true' if json.loads(base64.b64decode(d['content']).decode()).get('stop_requested') else 'false')" 2>/dev/null || echo "false")
+
+            if [ "$CUR_STOP_REQUESTED" = "true" ]; then
+              echo "stop_requested=true in control.json -- Meta-Site has claimed restart authority for a graceful stop (pause/delete). Stopping cleanly, no successor will be primed."
+              kill -TERM "$BOT_PID" 2>/dev/null || true
+              wait "$BOT_PID" 2>/dev/null || true
+              EXIT_SENTINEL="stop_requested"
+              break
+            fi
+
+            _time_left=$(( END_TIME - $(date +%s) ))
+            _credentials_changed="false"
+            if [ -n "$CUR_CREDENTIALS_UPDATED_AT" ] && [ "$CUR_CREDENTIALS_UPDATED_AT" != "$LAUNCH_CREDENTIALS_UPDATED_AT" ]; then
+              _credentials_changed="true"
+            fi
+
+            if [ "$PRIMER_DISPATCHED" = "false" ] && ( [ "$_time_left" -le "$HANDOFF_MARGIN_SECONDS" ] || [ "$_credentials_changed" = "true" ] ); then
+              PRIMER_DISPATCHED="true"
+              if [ "$_credentials_changed" = "true" ]; then
+                echo "credentials_updated_at changed (${LAUNCH_CREDENTIALS_UPDATED_AT} -> ${CUR_CREDENTIALS_UPDATED_AT}) -- requesting graceful handoff to pick up new credentials."
+              fi
+              cur_phase=$(read_handoff_field phase)
+              if [ -z "$cur_phase" ] || [ "$cur_phase" = "idle" ]; then
+                write_handoff_json "{\"phase\": \"priming\", \"primer_instance_id\": null, \"go_ts\": null}"
+                curl -s -X POST \
+                  -H "Authorization: token ${META_BOT_GITHUB_PAT}" \
+                  -H "Accept: application/vnd.github.v3+json" \
+                  "https://api.github.com/repos/${{ github.repository }}/dispatches" \
+                  -d "{\"event_type\":\"prime-bot-{{BOT_NAME}}\"}"
+                echo "Primer dispatched."
+              fi
+            fi
+
+            if [ "$PRIMER_DISPATCHED" = "true" ]; then
+              cur_phase=$(read_handoff_field phase)
+              cur_primer=$(read_handoff_field primer_instance_id)
+              if [ "$cur_phase" = "ready" ] && [ -n "$cur_primer" ]; then
+                echo "Primer ${cur_primer} is ready -- yielding now."
+                write_handoff_json "{\"phase\": \"go_sent\", \"primer_instance_id\": \"${cur_primer}\", \"go_ts\": true}"
+                EXIT_SENTINEL="handoff_yielded"
+                break
+              fi
+            fi
+          done
+
+          kill "$BOT_PID" 2>/dev/null || true
+          wait "$BOT_PID" 2>/dev/null || true
+          kill "$PROBE_PID" 2>/dev/null || true
+
+          echo "exit_sentinel=${EXIT_SENTINEL}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload DB artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: {{DB_ARTIFACT_NAME}}
+          path: private/${{ env.BOT_DIR_REPO_PATH }}/tradesv3.sqlite
+          retention-days: 7
+
+      - name: Write DB snapshot fallback to private repo
+        if: always()
+        run: |
+          BOT_DB_PATH="${WORKING_DIR}/${BOT_DIR}/tradesv3.sqlite"
+          if [ -f "$BOT_DB_PATH" ]; then
+            B64=$(base64 -w0 "$BOT_DB_PATH")
+            DOUBLE_B64=$(printf '%s' "$B64" | base64 -w0)
+            SHA=$(curl -s -H "Authorization: token ${META_BOT_GITHUB_PAT}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY_OWNER}/${PRIVATE_REPO}/contents/${BOT_DIR_REPO_PATH}/db_snapshot.sqlite.b64" \
+              | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("sha","") if isinstance(d,dict) else "")' 2>/dev/null || echo "")
+            if [ -n "$SHA" ]; then
+              BODY=$(python3 -c "import json,sys; print(json.dumps({'message': 'db snapshot: update', 'content': sys.argv[1], 'sha': sys.argv[2]}))" "$DOUBLE_B64" "$SHA")
+            else
+              BODY=$(python3 -c "import json,sys; print(json.dumps({'message': 'db snapshot: create', 'content': sys.argv[1]}))" "$DOUBLE_B64")
+            fi
+            curl -s -X PUT \
+              -H "Authorization: token ${META_BOT_GITHUB_PAT}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY_OWNER}/${PRIVATE_REPO}/contents/${BOT_DIR_REPO_PATH}/db_snapshot.sqlite.b64" \
+              -d "$BODY"
+          fi
+
+      - name: Detach Cloudflare Quick Tunnel
+        if: always()
+        run: |
+          if [ -f /tmp/cloudflared.pid ]; then
+            kill "$(cat /tmp/cloudflared.pid)" 2>/dev/null || true
+          fi
+
+      - name: Schedule next run
+        if: always() && (env.HANDOFF_MODE != 'primer' || steps.primer_mode.outputs.got_go == 'true')
+        run: |
+          EXIT_SENTINEL="${{ steps.run_bot.outputs.exit_sentinel }}"
+          CONTROL_JSON_PATH="${WORKING_DIR}/${BOT_DIR}/control.json"
+
+          if [ "$EXIT_SENTINEL" = "handoff_yielded" ]; then
+            echo "Clean handoff detected -- successor is already live under the '-primer' concurrency group. Skipping self-dispatch entirely."
+            exit 0
+          fi
+
+          if [ "$EXIT_SENTINEL" = "stop_requested" ]; then
+            echo "Graceful stop was requested via control.json (pause/delete) -- process exited cleanly, no successor primed. Skipping self-dispatch entirely."
+            exit 0
+          fi
+
+          # Re-pull the private repo before reading control.json below.
+          # This working copy was checked out once at job start and can
+          # be stale by the time a long-running bot process exits --
+          # Meta-Site may have written meta_restart/paused into
+          # control.json in the private repo on GitHub any time during
+          # the run, and the local clone has no way to see that write
+          # without a fresh pull. Without this, the restart-authority
+          # checks below could read stale local state and wrongly
+          # conclude "no claim found", double-dispatching the bot
+          # against Meta-Site's own handling of the same restart.
+          (
+            cd "${WORKING_DIR}/.." && \
+            source freqtrade-core/scripts/git_conflict_safety.sh && \
+            git_safe_pull_rebase
+          ) || echo "Warning: safe-pull before restart-authority check failed -- proceeding with local state as a best effort."
+
+          if [ -f "$CONTROL_JSON_PATH" ] && grep -q '"paused": *true' "$CONTROL_JSON_PATH"; then
+            echo "Bot is paused -- not scheduling next run."
+            exit 0
+          fi
+
+          if [ -f "$CONTROL_JSON_PATH" ] && grep -q '"meta_restart": *true' "$CONTROL_JSON_PATH"; then
+            echo "Meta-Site is handling this restart -- skipping self-dispatch."
+            exit 0
+          fi
+
+          echo "No claim found -- self-dispatching as fallback."
+          curl -s -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/${{ github.repository }}/dispatches \
+            -d '{"event_type":"restart-bot-{{BOT_NAME}}"}'
