@@ -7,14 +7,14 @@
 # FLEET-BATCHING ARCHITECTURE section — three separate, independent
 # pools: Live Bot batches, Custom Bot/Site batches, and dedicated WFO
 # bots, never cross-filled). Meta-Site writes the substituted result
-# to .github/workflows/batch-live-20260826071414-ye8obv.yml.
+# to .github/workflows/batch-live-20260826081717-dt7sf6.yml.
 #
 # Tokens used in this template:
-#   live-20260826071414-ye8obv          — the batch's unique ID
+#   live-20260826081717-dt7sf6          — the batch's unique ID
 #   miadol — the private repo name
 #
 # members.json (private-repo, at
-# freqtrade-core/user_data/batches/live-20260826071414-ye8obv/members.json) is the
+# freqtrade-core/user_data/batches/live-20260826081717-dt7sf6/members.json) is the
 # single source of truth for batch membership, written by Meta-Site
 # whenever a bot is placed into or removed from this batch. This
 # workflow reads it fresh on every run so a bot added between runs is
@@ -29,7 +29,7 @@
 # clock and no coordinated whole-batch handoff.
 #
 # Pass 19 adds the batch-wide shared handoff document at
-# freqtrade-core/user_data/batches/live-20260826071414-ye8obv/handoff.json and its
+# freqtrade-core/user_data/batches/live-20260826081717-dt7sf6/handoff.json and its
 # ready_bots sub-check, anchored to batch-formation time (T0, read
 # from members.json's created_at) rather than wall-clock. This pass
 # ensures the document exists at run start and lets each member
@@ -69,15 +69,15 @@
 #     "ready_bots": [{"bot_name": "bot_a", "ready_at": "<ISO>"}]
 #   }
 
-name: Batch - live-20260826071414-ye8obv
+name: Batch - live-20260826081717-dt7sf6
 
 on:
   workflow_dispatch:
   repository_dispatch:
-    types: [restart-batch-live-20260826071414-ye8obv, prime-batch-live-20260826071414-ye8obv]
+    types: [restart-batch-live-20260826081717-dt7sf6, prime-batch-live-20260826081717-dt7sf6]
 
 concurrency:
-  group: ${{ github.event.action == 'prime-batch-live-20260826071414-ye8obv' && 'batch-live-20260826071414-ye8obv-primer' || 'batch-live-20260826071414-ye8obv' }}
+  group: ${{ github.event.action == 'prime-batch-live-20260826081717-dt7sf6' && 'batch-live-20260826081717-dt7sf6-primer' || 'batch-live-20260826081717-dt7sf6' }}
   cancel-in-progress: true
 
 jobs:
@@ -91,10 +91,10 @@ jobs:
       META_BOT_GITHUB_PAT: ${{ secrets.META_BOT_GITHUB_PAT }}
       GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
       PRIVATE_REPO: miadol
-      BATCH_ID: live-20260826071414-ye8obv
-      MEMBERS_REPO_PATH: freqtrade-core/user_data/batches/live-20260826071414-ye8obv/members.json
-      HANDOFF_REPO_PATH: freqtrade-core/user_data/batches/live-20260826071414-ye8obv/handoff.json
-      HANDOFF_MODE: ${{ github.event.action == 'prime-batch-live-20260826071414-ye8obv' && 'primer' || 'normal' }}
+      BATCH_ID: live-20260826081717-dt7sf6
+      MEMBERS_REPO_PATH: freqtrade-core/user_data/batches/live-20260826081717-dt7sf6/members.json
+      HANDOFF_REPO_PATH: freqtrade-core/user_data/batches/live-20260826081717-dt7sf6/handoff.json
+      HANDOFF_MODE: ${{ github.event.action == 'prime-batch-live-20260826081717-dt7sf6' && 'primer' || 'normal' }}
       WORKING_DIR: ${{ github.workspace }}/private/freqtrade-core
       MAX_BATCH_MEM_MB: 4096
     steps:
@@ -129,7 +129,7 @@ jobs:
             -H "Accept: application/vnd.github.v3+json" \
             "https://api.github.com/repos/${GITHUB_REPOSITORY_OWNER}/${PRIVATE_REPO}/contents/${MEMBERS_REPO_PATH}")
           if [ "$MEMBERS_HTTP" != "200" ]; then
-            echo "::warning::members.json not found for batch live-20260826071414-ye8obv -- nothing to run this cycle."
+            echo "::warning::members.json not found for batch live-20260826081717-dt7sf6 -- nothing to run this cycle."
             echo "member_count=0" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -152,7 +152,7 @@ jobs:
         if: steps.members.outputs.member_count != '0'
         id: handoff_doc
         env:
-          HANDOFF_REPO_PATH: freqtrade-core/user_data/batches/live-20260826071414-ye8obv/handoff.json
+          HANDOFF_REPO_PATH: freqtrade-core/user_data/batches/live-20260826081717-dt7sf6/handoff.json
         run: |
           gh_get_handoff_doc() {
             curl -s -H "Authorization: token ${META_BOT_GITHUB_PAT}" \
@@ -212,7 +212,7 @@ jobs:
           with open('/tmp/members.json') as mf:
               members = json.load(mf)
           doc = {
-              'batch_id': 'live-20260826071414-ye8obv',
+              'batch_id': 'live-20260826081717-dt7sf6',
               't0': '${BATCH_T0}',
               'phase': 'idle',
               'primer_instance_id': None,
@@ -226,7 +226,7 @@ jobs:
           fi
 
           DOC_B64=$(base64 -w0 /tmp/handoff_doc.json)
-          gh_put_handoff_doc "$DOC_B64" "meta-site: sync batch handoff document live-20260826071414-ye8obv"
+          gh_put_handoff_doc "$DOC_B64" "meta-site: sync batch handoff document live-20260826081717-dt7sf6"
 
       - name: Primer mode wait
         if: env.HANDOFF_MODE == 'primer' && steps.members.outputs.member_count != '0'
@@ -392,7 +392,7 @@ jobs:
             [ -z "$BOT_NAME" ] && continue
             TOTAL_MEM_MB=$((TOTAL_MEM_MB + MAX_MEM_MB))
             if [ "$TOTAL_MEM_MB" -gt "$MAX_BATCH_MEM_MB" ]; then
-              echo "::warning::batch live-20260826071414-ye8obv projected memory ${TOTAL_MEM_MB}MB exceeds ${MAX_BATCH_MEM_MB}MB soft guardrail at member ${BOT_NAME} -- launching anyway (soft, not enforced by the runner), flag for rebalancing."
+              echo "::warning::batch live-20260826081717-dt7sf6 projected memory ${TOTAL_MEM_MB}MB exceeds ${MAX_BATCH_MEM_MB}MB soft guardrail at member ${BOT_NAME} -- launching anyway (soft, not enforced by the runner), flag for rebalancing."
             fi
 
             if [ "$BOT_TYPE" = "live" ]; then
@@ -410,7 +410,7 @@ jobs:
                 "https://api.github.com/repos/${GITHUB_REPOSITORY_OWNER}/${PRIVATE_REPO}/contents/${BOT_DIR_REPO_PATH}/control.json")
 
               if [ "$MEMBER_SECRETS_HTTP" != "200" ] || [ "$MEMBER_CONTROL_HTTP" != "200" ]; then
-                echo "::error::batch live-20260826071414-ye8obv member ${BOT_NAME}: secrets.json or control.json missing (secrets=$MEMBER_SECRETS_HTTP, control=$MEMBER_CONTROL_HTTP) -- skipping this member this cycle rather than launching without credentials."
+                echo "::error::batch live-20260826081717-dt7sf6 member ${BOT_NAME}: secrets.json or control.json missing (secrets=$MEMBER_SECRETS_HTTP, control=$MEMBER_CONTROL_HTTP) -- skipping this member this cycle rather than launching without credentials."
               else
                 python3 -c "
           import json, base64
@@ -423,7 +423,7 @@ jobs:
                   out.write(decoded)
           "
                 python3 -c "
-          import json
+          import json, hashlib
 
           with open('/tmp/secrets_${BOT_NAME}_decoded.json') as f:
               secrets = json.load(f)
@@ -447,7 +447,9 @@ jobs:
           config['api_server']['listen_port'] = ${ENTRY_PORT}
           config['api_server']['username'] = secrets.get('freq_ui_username', '')
           config['api_server']['password'] = secrets.get('freq_ui_password', '')
-          config['api_server']['jwt_secret_key'] = secrets.get('freq_ui_password', '')
+          config['api_server']['jwt_secret_key'] = hashlib.sha256(
+              ('jwt:' + secrets.get('freq_ui_password', '')).encode()
+          ).hexdigest()
 
           telegram_token = secrets.get('telegram_token')
           telegram_chat_id = secrets.get('telegram_chat_id')
@@ -538,7 +540,7 @@ jobs:
             MEMLIMITS["$BOT_NAME"]="$MAX_MEM_MB"
           done < /tmp/member_launch.txt
 
-          echo "Batch live-20260826071414-ye8obv launched ${#PIDS[@]} member process(es), projected ${TOTAL_MEM_MB}MB against a ${MAX_BATCH_MEM_MB}MB soft guardrail."
+          echo "Batch live-20260826081717-dt7sf6 launched ${#PIDS[@]} member process(es), projected ${TOTAL_MEM_MB}MB against a ${MAX_BATCH_MEM_MB}MB soft guardrail."
 
           PROBE_TRACKED_PIDS=""
           for BOT_NAME in "${!PIDS[@]}"; do
@@ -550,9 +552,9 @@ jobs:
 
           PROBE_TRACKED_PIDS="${PROBE_TRACKED_PIDS}" \
           PROBE_PORT_CHECKS="${PROBE_PORT_CHECKS}" \
-          PROBE_RUNNER_ID="batch-live-20260826071414-ye8obv" \
+          PROBE_RUNNER_ID="batch-live-20260826081717-dt7sf6" \
           PROBE_POOL="live" \
-          PROBE_STATUS_PATH="freqtrade-core/user_data/probes/batch-live-20260826071414-ye8obv.json" \
+          PROBE_STATUS_PATH="freqtrade-core/user_data/probes/batch-live-20260826081717-dt7sf6.json" \
           META_BOT_GITHUB_PAT="${META_BOT_GITHUB_PAT}" \
           META_BOT_GITHUB_OWNER="${GITHUB_REPOSITORY_OWNER}" \
           META_BOT_PRIVATE_REPO_NAME="${PRIVATE_REPO}" \
@@ -562,7 +564,7 @@ jobs:
           STOP_AFTER_SECONDS=$((5*3600 + 50*60))
           END_TIME=$(( $(date +%s) + STOP_AFTER_SECONDS ))
           HANDOFF_MARGIN_SECONDS=$((15*60))
-          HANDOFF_REPO_PATH="freqtrade-core/user_data/batches/live-20260826071414-ye8obv/handoff.json"
+          HANDOFF_REPO_PATH="freqtrade-core/user_data/batches/live-20260826081717-dt7sf6/handoff.json"
 
           mark_bot_ready_in_handoff() {
             local bot_name="$1"
@@ -656,12 +658,12 @@ jobs:
           " 2>/dev/null || echo "false")
 
               if [ "$ALL_READY" = "true" ] && [ "$PRIMER_DISPATCHED" = "false" ]; then
-                echo "All expected bots ready -- dispatching primer for batch live-20260826071414-ye8obv."
+                echo "All expected bots ready -- dispatching primer for batch live-20260826081717-dt7sf6."
                 curl -s -X POST \
                   -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
                   -H "Accept: application/vnd.github.v3+json" \
                   "https://api.github.com/repos/${{ github.repository }}/dispatches" \
-                  -d "{\"event_type\":\"prime-batch-live-20260826071414-ye8obv\"}" > /dev/null
+                  -d "{\"event_type\":\"prime-batch-live-20260826081717-dt7sf6\"}" > /dev/null
                 PRIMER_DISPATCHED="true"
               fi
 
@@ -675,7 +677,7 @@ jobs:
                   "https://api.github.com/repos/${GITHUB_REPOSITORY_OWNER}/${PRIVATE_REPO}/contents/${HANDOFF_REPO_PATH}" \
                   | python3 -c "import sys,json,base64; d=json.load(sys.stdin); h=json.loads(base64.b64decode(d['content']).decode()); print(h.get('primer_instance_id','') or '')" 2>/dev/null || echo "")
                 if [ "$cur_phase" = "ready" ] && [ -n "$cur_primer" ]; then
-                  echo "Primer ${cur_primer} is ready -- yielding batch live-20260826071414-ye8obv now."
+                  echo "Primer ${cur_primer} is ready -- yielding batch live-20260826081717-dt7sf6 now."
                   doc_resp=$(curl -s -H "Authorization: token ${META_BOT_GITHUB_PAT}" \
                     -H "Accept: application/vnd.github.v3+json" \
                     "https://api.github.com/repos/${GITHUB_REPOSITORY_OWNER}/${PRIVATE_REPO}/contents/${HANDOFF_REPO_PATH}")
@@ -690,7 +692,7 @@ jobs:
           doc['go_ts'] = '$(date -u +%Y-%m-%dT%H:%M:%SZ)'
           print(base64.b64encode(json.dumps(doc, indent=2).encode()).decode())
           ")
-                    body=$(python3 -c "import json,sys; print(json.dumps({'message': sys.argv[1], 'content': sys.argv[2], 'sha': sys.argv[3]}))" "handoff: go_sent for batch live-20260826071414-ye8obv" "$updated_b64" "$sha")
+                    body=$(python3 -c "import json,sys; print(json.dumps({'message': sys.argv[1], 'content': sys.argv[2], 'sha': sys.argv[3]}))" "handoff: go_sent for batch live-20260826081717-dt7sf6" "$updated_b64" "$sha")
                     curl -s -X PUT \
                       -H "Authorization: token ${META_BOT_GITHUB_PAT}" \
                       -H "Accept: application/vnd.github.v3+json" \
@@ -740,7 +742,7 @@ jobs:
           done < /tmp/member_names.txt
 
       - name: Schedule next run
-        if: always() && (env.HANDOFF_MODE != 'primer' || steps.primer_mode.outputs.got_go == 'true')
+        if: always() && steps.members.outputs.member_count != '0' && (env.HANDOFF_MODE != 'primer' || steps.primer_mode.outputs.got_go == 'true')
         run: |
           EXIT_SENTINEL=$(cat /tmp/exit_sentinel.txt 2>/dev/null || echo "")
           if [ "$EXIT_SENTINEL" = "handoff_yielded" ]; then
@@ -769,4 +771,4 @@ jobs:
             -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
             -H "Accept: application/vnd.github.v3+json" \
             https://api.github.com/repos/${{ github.repository }}/dispatches \
-            -d '{"event_type":"restart-batch-live-20260826071414-ye8obv"}'
+            -d '{"event_type":"restart-batch-live-20260826081717-dt7sf6"}'
