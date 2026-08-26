@@ -378,30 +378,12 @@ jobs:
         if: steps.members.outputs.member_count != '0' && (env.HANDOFF_MODE != 'primer' || steps.primer_mode.outputs.got_go == 'true')
         id: run_members
         run: |
-          python3 -c "
-          import json
-          with open('/tmp/members.json') as f:
-              members = json.load(f)
-          live_slot = 0
-          for m in members:
-              name = m['bot_name']
-              strat = m.get('strategy_class', '')
-              mem = m.get('max_mem_mb', 256)
-              bot_type = m.get('bot_type', 'live')
-              bot_dir = m.get('bot_dir', '')
-              if bot_type == 'live':
-                  # Each live-bot member in a shared batch runs on the same VM,
-                  # so each needs its own loopback FreqUI port -- 8080 is
-                  # reserved for the dedicated-workflow case (Pass 12/28) where
-                  # there's only ever one live bot per runner. 8081+ here keeps
-                  # the two cases from ever colliding even though they never
-                  # actually share a runner.
-                  port = 8081 + live_slot
-                  live_slot += 1
-              else:
-                  port = m.get('entry_port', '')
-              print(str(name) + '|' + str(strat) + '|' + str(mem) + '|' + str(bot_type) + '|' + str(port) + '|' + str(bot_dir))
-          " > /tmp/member_launch.txt
+          # Pass 54: extracted to scripts/parse_member_launch_list.py
+          # (was an inline python3 -c). Logic unchanged, only where it
+          # lives changed -- see the "Launch member processes" step's
+          # own comment further down for why several blocks in this
+          # step were pulled out.
+          python3 "${WORKING_DIR}/scripts/parse_member_launch_list.py"
 
           TOKEN_ENV_ALIASES="BOT_TOKEN TELEGRAM_BOT_TOKEN TELEGRAM_TOKEN TITAN_BOT_TOKEN TG_TOKEN TG_BOT_TOKEN"
           CHAT_ID_ENV_ALIASES="CHAT_ID TELEGRAM_CHAT_ID TITAN_CHAT_ID TG_CHAT_ID"
@@ -447,55 +429,15 @@ jobs:
               if [ "$MEMBER_SECRETS_HTTP" != "200" ] || [ "$MEMBER_CONTROL_HTTP" != "200" ]; then
                 echo "::error::batch {{BATCH_ID}} member ${BOT_NAME}: secrets.json or control.json missing (secrets=$MEMBER_SECRETS_HTTP, control=$MEMBER_CONTROL_HTTP) -- skipping this member this cycle rather than launching without credentials."
               else
-                python3 -c "
-          import json, base64
-          for tag in ['secrets', 'control']:
-              with open('/tmp/' + tag + '_${BOT_NAME}.json') as f:
-                  d = json.load(f)
-              content_b64 = d['content'].replace('\n', '')
-              decoded = base64.b64decode(content_b64)
-              with open('/tmp/' + tag + '_${BOT_NAME}_decoded.json', 'wb') as out:
-                  out.write(decoded)
-          "
-                python3 -c "
-          import json, hashlib
-
-          with open('/tmp/secrets_${BOT_NAME}_decoded.json') as f:
-              secrets = json.load(f)
-          with open('/tmp/control_${BOT_NAME}_decoded.json') as f:
-              control = json.load(f)
-
-          base_config_text = control.get('base_config', '') or ''
-          try:
-              config = json.loads(base_config_text) if base_config_text.strip() else {}
-          except json.JSONDecodeError:
-              config = {}
-
-          config['dry_run'] = bool(control.get('dry_run', True))
-          config['exchange'] = config.get('exchange', {})
-          config['exchange']['key'] = secrets.get('exchange_api_key', '')
-          config['exchange']['secret'] = secrets.get('exchange_api_secret', '')
-
-          config['api_server'] = config.get('api_server', {})
-          config['api_server']['enabled'] = True
-          config['api_server']['listen_ip_address'] = '127.0.0.1'
-          config['api_server']['listen_port'] = ${ENTRY_PORT}
-          config['api_server']['username'] = secrets.get('freq_ui_username', '')
-          config['api_server']['password'] = secrets.get('freq_ui_password', '')
-          config['api_server']['jwt_secret_key'] = hashlib.sha256(
-              ('jwt:' + secrets.get('freq_ui_password', '')).encode()
-          ).hexdigest()
-
-          telegram_token = secrets.get('telegram_token')
-          telegram_chat_id = secrets.get('telegram_chat_id')
-          if telegram_token and telegram_chat_id:
-              config['telegram'] = {'enabled': True, 'token': telegram_token, 'chat_id': telegram_chat_id}
-          else:
-              config['telegram'] = {'enabled': False, 'token': '', 'chat_id': ''}
-
-          with open('${WORKING_DIR}/${BOT_DIR}/config.json', 'w') as out:
-              json.dump(config, out, indent=2)
-          "
+                # Pass 54: extracted to scripts/build_member_config.py
+                # (was two inline python3 -c blocks -- decode secrets/
+                # control, then build config.json). Logic unchanged,
+                # only where it lives changed; see that step's comment
+                # for why this and two other blocks were pulled out of
+                # this step. Reads secrets.json/control.json from disk
+                # rather than taking them as args, so no key/secret/
+                # password value ever appears in a process listing.
+                python3 "${WORKING_DIR}/scripts/build_member_config.py" "${BOT_NAME}" "${ENTRY_PORT}" "${WORKING_DIR}/${BOT_DIR}/config.json"
                 (cd "${WORKING_DIR}" && exec python3 -m freqtrade trade \
                   --config "${BOT_DIR}/config.json" \
                   --db-url "sqlite:///${BOT_DIR}/tradesv3.sqlite" \
@@ -518,80 +460,23 @@ jobs:
                 # attach block (install already happened once at
                 # workflow setup, shared across all members), but every
                 # path/port that would collide across N members sharing
-                # one runner is namespaced by BOT_NAME:
-                #   - pidfile/log: /tmp/cloudflared_${BOT_NAME}.{pid,log}
-                #     (was a single shared /tmp/cloudflared.{pid,log} in
-                #     the standalone template -- fine for one bot per
-                #     runner, a direct collision for N in one runner)
-                #   - --metrics: cloudflared binds 127.0.0.1:20241 by
-                #     default regardless of --url; two instances in one
-                #     runner would collide on THAT even though their
-                #     actual tunnels don't conflict with each other.
-                #     Derived from ENTRY_PORT (already unique per member)
-                #     rather than a second counter, so no new allocation
-                #     scheme is needed.
-                # Runs as a background subshell (own `&`) so it never
-                # blocks this member's own launch loop iteration; a
-                # short poll loop below waits for freqtrade's own port
-                # before ever starting cloudflared, same "don't attach
-                # a tunnel to a port nothing is serving yet" reasoning
-                # bot-template.yml's own attach step already uses.
-                (
-                  CF_PIDFILE="/tmp/cloudflared_${BOT_NAME}.pid"
-                  CF_LOGFILE="/tmp/cloudflared_${BOT_NAME}.log"
-                  CF_METRICS_PORT=$((20000 + ENTRY_PORT % 10000))
-
-                  PORT_WAITED=0
-                  while [ "$PORT_WAITED" -lt 60 ]; do
-                    if curl -s -o /dev/null "http://127.0.0.1:${ENTRY_PORT}/api/v1/ping"; then
-                      break
-                    fi
-                    sleep 1
-                    PORT_WAITED=$((PORT_WAITED + 1))
-                  done
-                  if [ "$PORT_WAITED" -ge 60 ]; then
-                    echo "::warning::batch {{BATCH_ID}} member ${BOT_NAME}: freqtrade's API server did not come up on port ${ENTRY_PORT} within timeout -- skipping tunnel attach this cycle, will retry on next handoff."
-                    exit 0
-                  fi
-
-                  nohup cloudflared tunnel --url "http://127.0.0.1:${ENTRY_PORT}" \
-                    --metrics "127.0.0.1:${CF_METRICS_PORT}" \
-                    > "$CF_LOGFILE" 2>&1 &
-                  echo $! > "$CF_PIDFILE"
-
-                  CF_TUNNEL_URL=""
-                  CF_WAITED=0
-                  while [ "$CF_WAITED" -lt 30 ]; do
-                    CF_TUNNEL_URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' "$CF_LOGFILE" | head -n1 || true)
-                    if [ -n "$CF_TUNNEL_URL" ]; then
-                      break
-                    fi
-                    sleep 1
-                    CF_WAITED=$((CF_WAITED + 1))
-                  done
-
-                  if [ -z "$CF_TUNNEL_URL" ]; then
-                    echo "::warning::batch {{BATCH_ID}} member ${BOT_NAME}: cloudflared did not report a tunnel URL within timeout -- FreqUI will be unreachable this cycle."
-                    exit 0
-                  fi
-
-                  echo "Batch {{BATCH_ID}} member ${BOT_NAME}: tunnel attached: ${CF_TUNNEL_URL}"
-                  TUNNEL_BODY=$(python3 -c "import json,sys; print(json.dumps({'tunnel_url': sys.argv[1], 'bot_name': sys.argv[2], 'updated_at': __import__('datetime').datetime.utcnow().isoformat() + 'Z'}))" "$CF_TUNNEL_URL" "$BOT_NAME")
-                  TUNNEL_B64=$(printf '%s' "$TUNNEL_BODY" | base64 -w0)
-                  TUNNEL_SHA=$(curl -s -H "Authorization: token ${META_BOT_GITHUB_PAT}" \
-                    -H "Accept: application/vnd.github.v3+json" \
-                    "https://api.github.com/repos/${GITHUB_REPOSITORY_OWNER}/${PRIVATE_REPO}/contents/${BOT_DIR_REPO_PATH}/tunnel.json" \
-                    | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('sha',''))" 2>/dev/null || true)
-                  if [ -n "$TUNNEL_SHA" ]; then
-                    PUT_BODY=$(python3 -c "import json,sys; print(json.dumps({'message': 'tunnel: attach', 'content': sys.argv[1], 'sha': sys.argv[2]}))" "$TUNNEL_B64" "$TUNNEL_SHA")
-                  else
-                    PUT_BODY=$(python3 -c "import json,sys; print(json.dumps({'message': 'tunnel: attach', 'content': sys.argv[1]}))" "$TUNNEL_B64")
-                  fi
-                  curl -s -X PUT -H "Authorization: token ${META_BOT_GITHUB_PAT}" \
-                    -H "Accept: application/vnd.github.v3+json" \
-                    "https://api.github.com/repos/${GITHUB_REPOSITORY_OWNER}/${PRIVATE_REPO}/contents/${BOT_DIR_REPO_PATH}/tunnel.json" \
-                    -d "$PUT_BODY" > /dev/null
-                ) &
+                # one runner is namespaced by BOT_NAME (see
+                # scripts/attach_tunnel.sh for the pidfile/log/--metrics
+                # namespacing detail).
+                # Pass 54: extracted to scripts/attach_tunnel.sh -- this
+                # ~90-line inline subshell was, together with the
+                # secrets/config builder and mark_bot_ready_in_handoff
+                # below, why this step's total run: content exceeded
+                # GitHub Actions' 21,000-char expression-length ceiling
+                # ("Exceeded max expression length 21000" at pass 53).
+                # Logic is byte-for-byte identical, only where it lives
+                # changed. Still backgrounded with its own `&` so it
+                # never blocks this member's own launch loop iteration.
+                BATCH_ID_LABEL="{{BATCH_ID}}" \
+                META_BOT_GITHUB_PAT="${META_BOT_GITHUB_PAT}" \
+                GITHUB_REPOSITORY_OWNER="${GITHUB_REPOSITORY_OWNER}" \
+                PRIVATE_REPO="${PRIVATE_REPO}" \
+                bash "${WORKING_DIR}/scripts/attach_tunnel.sh" "$BOT_NAME" "$ENTRY_PORT" "$BOT_DIR_REPO_PATH" &
                 TUNNEL_PIDS["$BOT_NAME"]=$!
               fi
             else
@@ -702,37 +587,20 @@ jobs:
           HANDOFF_MARGIN_SECONDS=$((15*60))
           HANDOFF_REPO_PATH="freqtrade-core/user_data/batches/{{BATCH_ID}}/handoff.json"
 
+          # Pass 54: extracted to scripts/mark_bot_ready.sh (was the
+          # mark_bot_ready_in_handoff shell function, defined and
+          # sourced inline). Logic unchanged, only where it lives
+          # changed -- see the tunnel-attach step's comment above for
+          # why. Called below as a plain script rather than a sourced
+          # function; MARKED_READY bookkeeping (which member has
+          # already been marked) still lives here since it's specific
+          # to this loop, not to the marking logic itself.
           mark_bot_ready_in_handoff() {
             local bot_name="$1"
-            for attempt in 1 2 3; do
-              doc_resp=$(curl -s -H "Authorization: token ${META_BOT_GITHUB_PAT}" \
-                -H "Accept: application/vnd.github.v3+json" \
-                "https://api.github.com/repos/${GITHUB_REPOSITORY_OWNER}/${PRIVATE_REPO}/contents/${HANDOFF_REPO_PATH}")
-              sha=$(echo "$doc_resp" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("sha","") if isinstance(d,dict) else "")' 2>/dev/null || echo "")
-              [ -z "$sha" ] && return 1
-              updated_b64=$(echo "$doc_resp" | python3 -c "
-          import sys, json, base64
-          d = json.load(sys.stdin)
-          content = base64.b64decode(d['content'].replace('\n', '')).decode()
-          doc = json.loads(content)
-          already = any(e['bot_name'] == '$bot_name' for e in doc.get('ready_bots', []))
-          if not already:
-              doc.setdefault('ready_bots', []).append({'bot_name': '$bot_name', 'ready_at': '$(date -u +%Y-%m-%dT%H:%M:%SZ)'})
-          print(base64.b64encode(json.dumps(doc, indent=2).encode()).decode())
-          ")
-              body=$(python3 -c "import json,sys; print(json.dumps({'message': sys.argv[1], 'content': sys.argv[2], 'sha': sys.argv[3]}))" "handoff: mark $bot_name ready" "$updated_b64" "$sha")
-              http_code=$(curl -s -o /tmp/mark_ready_resp.json -w "%{http_code}" \
-                -X PUT -H "Authorization: token ${META_BOT_GITHUB_PAT}" \
-                -H "Accept: application/vnd.github.v3+json" \
-                "https://api.github.com/repos/${GITHUB_REPOSITORY_OWNER}/${PRIVATE_REPO}/contents/${HANDOFF_REPO_PATH}" \
-                -d "$body")
-              if [ "$http_code" = "200" ] || [ "$http_code" = "201" ]; then
-                return 0
-              fi
-              sleep $((attempt * 2))
-            done
-            echo "::warning::mark_bot_ready_in_handoff failed for ${bot_name} after 3 attempts."
-            return 1
+            META_BOT_GITHUB_PAT="${META_BOT_GITHUB_PAT}" \
+            GITHUB_REPOSITORY_OWNER="${GITHUB_REPOSITORY_OWNER}" \
+            PRIVATE_REPO="${PRIVATE_REPO}" \
+            bash "${WORKING_DIR}/scripts/mark_bot_ready.sh" "$bot_name" "$HANDOFF_REPO_PATH"
           }
 
           declare -A MARKED_READY
