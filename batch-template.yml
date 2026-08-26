@@ -423,7 +423,7 @@ jobs:
                   out.write(decoded)
           "
                 python3 -c "
-          import json
+          import json, hashlib
 
           with open('/tmp/secrets_${BOT_NAME}_decoded.json') as f:
               secrets = json.load(f)
@@ -447,7 +447,9 @@ jobs:
           config['api_server']['listen_port'] = ${ENTRY_PORT}
           config['api_server']['username'] = secrets.get('freq_ui_username', '')
           config['api_server']['password'] = secrets.get('freq_ui_password', '')
-          config['api_server']['jwt_secret_key'] = secrets.get('freq_ui_password', '')
+          config['api_server']['jwt_secret_key'] = hashlib.sha256(
+              ('jwt:' + secrets.get('freq_ui_password', '')).encode()
+          ).hexdigest()
 
           telegram_token = secrets.get('telegram_token')
           telegram_chat_id = secrets.get('telegram_chat_id')
