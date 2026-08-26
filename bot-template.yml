@@ -258,46 +258,6 @@ jobs:
           curl -sL --output /tmp/cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
           sudo dpkg -i /tmp/cloudflared.deb
 
-      - name: Attach Cloudflare Quick Tunnel
-        id: tunnel_attach
-        run: |
-          FREQUI_PORT=8080
-          nohup cloudflared tunnel --url "http://localhost:${FREQUI_PORT}" > /tmp/cloudflared.log 2>&1 &
-          echo $! > /tmp/cloudflared.pid
-
-          TUNNEL_URL=""
-          for attempt in $(seq 1 20); do
-            sleep 3
-            TUNNEL_URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' /tmp/cloudflared.log | head -n1 || true)
-            if [ -n "$TUNNEL_URL" ]; then
-              break
-            fi
-          done
-
-          if [ -z "$TUNNEL_URL" ]; then
-            echo "::warning::cloudflared did not report a tunnel URL within timeout -- FreqUI will be unreachable this cycle."
-            echo "tunnel_url=" >> "$GITHUB_OUTPUT"
-          else
-            echo "Tunnel attached: ${TUNNEL_URL}"
-            echo "tunnel_url=${TUNNEL_URL}" >> "$GITHUB_OUTPUT"
-            TUNNEL_BODY=$(python3 -c "import json,sys; print(json.dumps({'tunnel_url': sys.argv[1], 'bot_name': sys.argv[2]}))" "$TUNNEL_URL" "$BOT_NAME")
-            TUNNEL_B64=$(printf '%s' "$TUNNEL_BODY" | base64 -w0)
-            TUNNEL_SHA=$(curl -s -H "Authorization: token ${META_BOT_GITHUB_PAT}" \
-              -H "Accept: application/vnd.github.v3+json" \
-              "https://api.github.com/repos/${GITHUB_REPOSITORY_OWNER}/${PRIVATE_REPO}/contents/${TUNNEL_STATUS_REPO_PATH}" \
-              | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("sha","") if isinstance(d,dict) else "")' 2>/dev/null || echo "")
-            if [ -n "$TUNNEL_SHA" ]; then
-              PUT_BODY=$(python3 -c "import json,sys; print(json.dumps({'message': 'tunnel: attach', 'content': sys.argv[1], 'sha': sys.argv[2]}))" "$TUNNEL_B64" "$TUNNEL_SHA")
-            else
-              PUT_BODY=$(python3 -c "import json,sys; print(json.dumps({'message': 'tunnel: attach', 'content': sys.argv[1]}))" "$TUNNEL_B64")
-            fi
-            curl -s -X PUT \
-              -H "Authorization: token ${META_BOT_GITHUB_PAT}" \
-              -H "Accept: application/vnd.github.v3+json" \
-              "https://api.github.com/repos/${GITHUB_REPOSITORY_OWNER}/${PRIVATE_REPO}/contents/${TUNNEL_STATUS_REPO_PATH}" \
-              -d "$PUT_BODY"
-          fi
-
       - name: Primer mode — wait for go signal
         if: env.HANDOFF_MODE == 'primer'
         id: primer_mode
@@ -428,6 +388,67 @@ jobs:
             --db-url "sqlite:///${BOT_DIR}/tradesv3.sqlite" \
             --strategy {{STRATEGY_CLASS}}) &
           BOT_PID=$!
+
+          # Tunnel attach happens here, after freqtrade has been launched
+          # (not as an earlier standalone step) so cloudflared always has
+          # something listening on 8080 before it's asked to front it.
+          # Previously this ran before freqtrade even started, so the
+          # tunnel came up pointing at a closed port and every downstream
+          # "Open FreqUI" attempt failed with "No active tunnel" regardless
+          # of anything else being correct.
+          FREQUI_PORT=8080
+          PORT_READY="false"
+          for attempt in $(seq 1 30); do
+            if ! kill -0 "$BOT_PID" 2>/dev/null; then
+              echo "::warning::freqtrade exited before its API server ever came up -- skipping tunnel attach this cycle."
+              break
+            fi
+            if curl -s -o /dev/null "http://localhost:${FREQUI_PORT}/api/v1/ping"; then
+              PORT_READY="true"
+              break
+            fi
+            sleep 2
+          done
+
+          if [ "$PORT_READY" != "true" ]; then
+            if kill -0 "$BOT_PID" 2>/dev/null; then
+              echo "::warning::freqtrade's API server did not come up on port ${FREQUI_PORT} within timeout -- skipping tunnel attach this cycle, will retry on next handoff."
+            fi
+          else
+            nohup cloudflared tunnel --url "http://localhost:${FREQUI_PORT}" > /tmp/cloudflared.log 2>&1 &
+            echo $! > /tmp/cloudflared.pid
+
+            TUNNEL_URL=""
+            for attempt in $(seq 1 20); do
+              sleep 3
+              TUNNEL_URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' /tmp/cloudflared.log | head -n1 || true)
+              if [ -n "$TUNNEL_URL" ]; then
+                break
+              fi
+            done
+
+            if [ -z "$TUNNEL_URL" ]; then
+              echo "::warning::cloudflared did not report a tunnel URL within timeout -- FreqUI will be unreachable this cycle."
+            else
+              echo "Tunnel attached: ${TUNNEL_URL}"
+              TUNNEL_BODY=$(python3 -c "import json,sys; print(json.dumps({'tunnel_url': sys.argv[1], 'bot_name': sys.argv[2]}))" "$TUNNEL_URL" "$BOT_NAME")
+              TUNNEL_B64=$(printf '%s' "$TUNNEL_BODY" | base64 -w0)
+              TUNNEL_SHA=$(curl -s -H "Authorization: token ${META_BOT_GITHUB_PAT}" \
+                -H "Accept: application/vnd.github.v3+json" \
+                "https://api.github.com/repos/${GITHUB_REPOSITORY_OWNER}/${PRIVATE_REPO}/contents/${TUNNEL_STATUS_REPO_PATH}" \
+                | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("sha","") if isinstance(d,dict) else "")' 2>/dev/null || echo "")
+              if [ -n "$TUNNEL_SHA" ]; then
+                PUT_BODY=$(python3 -c "import json,sys; print(json.dumps({'message': 'tunnel: attach', 'content': sys.argv[1], 'sha': sys.argv[2]}))" "$TUNNEL_B64" "$TUNNEL_SHA")
+              else
+                PUT_BODY=$(python3 -c "import json,sys; print(json.dumps({'message': 'tunnel: attach', 'content': sys.argv[1]}))" "$TUNNEL_B64")
+              fi
+              curl -s -X PUT \
+                -H "Authorization: token ${META_BOT_GITHUB_PAT}" \
+                -H "Accept: application/vnd.github.v3+json" \
+                "https://api.github.com/repos/${GITHUB_REPOSITORY_OWNER}/${PRIVATE_REPO}/contents/${TUNNEL_STATUS_REPO_PATH}" \
+                -d "$PUT_BODY"
+            fi
+          fi
 
           PROBE_TRACKED_PIDS="freqtrade:${BOT_PID}" \
           PROBE_RUNNER_ID="live-{{BOT_NAME}}" \
