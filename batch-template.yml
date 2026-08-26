@@ -121,6 +121,31 @@ jobs:
           fi
           pip install requests
 
+      # Pass 52 FOLLOW-UP: this step was missing entirely in the
+      # original Pass 52 -- the 'live' member launch loop's tunnel
+      # sidecar (see "Launch member processes" below) calls
+      # `cloudflared` directly assuming it's already on PATH, exactly
+      # like bot-template.yml's own attach step does, but unlike
+      # bot-template.yml, batch-template.yml never had a matching
+      # Install cloudflared step of its own anywhere in the job.
+      # Effect in practice: every batch run's tunnel sidecar subshell
+      # failed instantly and silently on `nohup cloudflared tunnel
+      # ...` (command not found), the 30s log-scrape wait loop timed
+      # out with nothing ever written to CF_LOGFILE, and the sidecar
+      # exited via its own "did not report a tunnel URL" ::warning::
+      # path -- which explains why grepping the run's own logs for
+      # "cloudflare" only ever matched this file's OWN comment text
+      # (echoed nowhere in the actual run output) rather than any real
+      # cloudflared invocation or error. One shared install here,
+      # before the member loop, covers every 'live' member's sidecar
+      # in this run -- same "install once per job, not once per bot"
+      # reasoning bot-template.yml already applies for its own single
+      # bot.
+      - name: Install cloudflared
+        run: |
+          curl -sL --output /tmp/cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i /tmp/cloudflared.deb
+
       - name: Read members.json
         id: members
         run: |
@@ -385,6 +410,16 @@ jobs:
           declare -A MEMLIMITS
           declare -A MEMBER_REPO_PATHS
           declare -A LAUNCH_CREDENTIALS_UPDATED_AT
+          # Pass 52: separate from PIDS (freqtrade/bot.py's own PID) --
+          # a 'live' member's tunnel sidecar is a second background
+          # subshell with its own PID, only ever populated for 'live'
+          # members whose tunnel attach actually started (see the
+          # attach block above). Kept as its own map rather than
+          # overloading PIDS so the main kill loop below can signal
+          # both independently without either one's absence (e.g. a
+          # custom_bot member, which has no tunnel sidecar at all)
+          # causing a bad lookup.
+          declare -A TUNNEL_PIDS
           TOTAL_MEM_MB=0
           PROBE_PORT_CHECKS=""
 
@@ -472,6 +507,92 @@ jobs:
           with open('/tmp/control_${BOT_NAME}_decoded.json') as f:
               print(json.load(f).get('credentials_updated_at') or '')
           " 2>/dev/null || echo "")
+
+                # Pass 52: per-member Cloudflare Quick Tunnel for 'live'
+                # batch members. Standalone live bots (bot-template.yml)
+                # have always had this; batch members never did -- the
+                # 'live' branch here launched freqtrade directly with no
+                # tunnel step at all, so every batched live bot's FreqUI
+                # was permanently unreachable regardless of freqtrade's
+                # own health. This mirrors bot-template.yml's own
+                # attach block (install already happened once at
+                # workflow setup, shared across all members), but every
+                # path/port that would collide across N members sharing
+                # one runner is namespaced by BOT_NAME:
+                #   - pidfile/log: /tmp/cloudflared_${BOT_NAME}.{pid,log}
+                #     (was a single shared /tmp/cloudflared.{pid,log} in
+                #     the standalone template -- fine for one bot per
+                #     runner, a direct collision for N in one runner)
+                #   - --metrics: cloudflared binds 127.0.0.1:20241 by
+                #     default regardless of --url; two instances in one
+                #     runner would collide on THAT even though their
+                #     actual tunnels don't conflict with each other.
+                #     Derived from ENTRY_PORT (already unique per member)
+                #     rather than a second counter, so no new allocation
+                #     scheme is needed.
+                # Runs as a background subshell (own `&`) so it never
+                # blocks this member's own launch loop iteration; a
+                # short poll loop below waits for freqtrade's own port
+                # before ever starting cloudflared, same "don't attach
+                # a tunnel to a port nothing is serving yet" reasoning
+                # bot-template.yml's own attach step already uses.
+                (
+                  CF_PIDFILE="/tmp/cloudflared_${BOT_NAME}.pid"
+                  CF_LOGFILE="/tmp/cloudflared_${BOT_NAME}.log"
+                  CF_METRICS_PORT=$((20000 + ENTRY_PORT % 10000))
+
+                  PORT_WAITED=0
+                  while [ "$PORT_WAITED" -lt 60 ]; do
+                    if curl -s -o /dev/null "http://127.0.0.1:${ENTRY_PORT}/api/v1/ping"; then
+                      break
+                    fi
+                    sleep 1
+                    PORT_WAITED=$((PORT_WAITED + 1))
+                  done
+                  if [ "$PORT_WAITED" -ge 60 ]; then
+                    echo "::warning::batch {{BATCH_ID}} member ${BOT_NAME}: freqtrade's API server did not come up on port ${ENTRY_PORT} within timeout -- skipping tunnel attach this cycle, will retry on next handoff."
+                    exit 0
+                  fi
+
+                  nohup cloudflared tunnel --url "http://127.0.0.1:${ENTRY_PORT}" \
+                    --metrics "127.0.0.1:${CF_METRICS_PORT}" \
+                    > "$CF_LOGFILE" 2>&1 &
+                  echo $! > "$CF_PIDFILE"
+
+                  CF_TUNNEL_URL=""
+                  CF_WAITED=0
+                  while [ "$CF_WAITED" -lt 30 ]; do
+                    CF_TUNNEL_URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' "$CF_LOGFILE" | head -n1 || true)
+                    if [ -n "$CF_TUNNEL_URL" ]; then
+                      break
+                    fi
+                    sleep 1
+                    CF_WAITED=$((CF_WAITED + 1))
+                  done
+
+                  if [ -z "$CF_TUNNEL_URL" ]; then
+                    echo "::warning::batch {{BATCH_ID}} member ${BOT_NAME}: cloudflared did not report a tunnel URL within timeout -- FreqUI will be unreachable this cycle."
+                    exit 0
+                  fi
+
+                  echo "Batch {{BATCH_ID}} member ${BOT_NAME}: tunnel attached: ${CF_TUNNEL_URL}"
+                  TUNNEL_BODY=$(python3 -c "import json,sys; print(json.dumps({'tunnel_url': sys.argv[1], 'bot_name': sys.argv[2], 'updated_at': __import__('datetime').datetime.utcnow().isoformat() + 'Z'}))" "$CF_TUNNEL_URL" "$BOT_NAME")
+                  TUNNEL_B64=$(printf '%s' "$TUNNEL_BODY" | base64 -w0)
+                  TUNNEL_SHA=$(curl -s -H "Authorization: token ${META_BOT_GITHUB_PAT}" \
+                    -H "Accept: application/vnd.github.v3+json" \
+                    "https://api.github.com/repos/${GITHUB_REPOSITORY_OWNER}/${PRIVATE_REPO}/contents/${BOT_DIR_REPO_PATH}/tunnel.json" \
+                    | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('sha',''))" 2>/dev/null || true)
+                  if [ -n "$TUNNEL_SHA" ]; then
+                    PUT_BODY=$(python3 -c "import json,sys; print(json.dumps({'message': 'tunnel: attach', 'content': sys.argv[1], 'sha': sys.argv[2]}))" "$TUNNEL_B64" "$TUNNEL_SHA")
+                  else
+                    PUT_BODY=$(python3 -c "import json,sys; print(json.dumps({'message': 'tunnel: attach', 'content': sys.argv[1]}))" "$TUNNEL_B64")
+                  fi
+                  curl -s -X PUT -H "Authorization: token ${META_BOT_GITHUB_PAT}" \
+                    -H "Accept: application/vnd.github.v3+json" \
+                    "https://api.github.com/repos/${GITHUB_REPOSITORY_OWNER}/${PRIVATE_REPO}/contents/${BOT_DIR_REPO_PATH}/tunnel.json" \
+                    -d "$PUT_BODY" > /dev/null
+                ) &
+                TUNNEL_PIDS["$BOT_NAME"]=$!
               fi
             else
               MEMBER_ABS_DIR="${WORKING_DIR}/${MEMBER_BOT_DIR#freqtrade-core/}"
@@ -724,6 +845,21 @@ jobs:
           for BOT_NAME in "${!PIDS[@]}"; do
             kill "${PIDS[$BOT_NAME]}" 2>/dev/null || true
             wait "${PIDS[$BOT_NAME]}" 2>/dev/null || true
+          done
+          # Pass 52: detach every member's own Cloudflare Quick Tunnel
+          # (see TUNNEL_PIDS's own declaration comment). Killing the
+          # sidecar subshell's PID is enough -- it's the direct parent
+          # of the `nohup cloudflared ... &` call, and cloudflared
+          # itself is what actually holds the tunnel open, but leaving
+          # freqtrade's own process dead with a stale tunnel pointed at
+          # a now-closed port is worse than tearing both down together
+          # on every exit path (always(), same as the standalone
+          # template's own Detach step).
+          for BOT_NAME in "${!TUNNEL_PIDS[@]}"; do
+            kill "${TUNNEL_PIDS[$BOT_NAME]}" 2>/dev/null || true
+            if [ -f "/tmp/cloudflared_${BOT_NAME}.pid" ]; then
+              kill "$(cat "/tmp/cloudflared_${BOT_NAME}.pid")" 2>/dev/null || true
+            fi
           done
           kill "$PROBE_PID" 2>/dev/null || true
 
