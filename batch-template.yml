@@ -461,7 +461,7 @@ jobs:
           with open('${WORKING_DIR}/${BOT_DIR}/config.json', 'w') as out:
               json.dump(config, out, indent=2)
           "
-                (cd "${WORKING_DIR}" && python3 -m freqtrade trade \
+                (cd "${WORKING_DIR}" && exec python3 -m freqtrade trade \
                   --config "${BOT_DIR}/config.json" \
                   --db-url "sqlite:///${BOT_DIR}/tradesv3.sqlite" \
                   --strategy "${STRATEGY_CLASS}") &
@@ -526,8 +526,10 @@ jobs:
                   rm -f "$EXTRA_EXPORTS_FILE"
                 fi
                 export ENTRY_PORT="${ENTRY_PORT}"
+                export MIAIE_BOT_NAME="${BOT_NAME}"
+                export MIAIE_TUNNEL_STATUS_REPO_PATH="${MEMBER_BOT_DIR}/tunnel.json"
 
-                python3 bot.py
+                exec python3 bot.py
               ) &
               PIDS["$BOT_NAME"]=$!
               if [ -n "$ENTRY_PORT" ]; then
