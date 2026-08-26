@@ -68,6 +68,15 @@
 # run-loop, so a handoff always re-points tunnel.json to the new
 # process's tunnel before the outgoing process's own tunnel is torn
 # down in its Detach step.
+#
+# Pass 58 moves ALL of that tunnel attach/hold/force-retry/detach logic
+# (previously ~150 lines of inline bash, grown across passes 16/52/54/
+# 56/57) out of this file entirely, into the single shared
+# scripts/tunnel_manager.py -- used identically by this template,
+# batch-template.yml, and (as an importable reference implementation)
+# custom bot.py authors. This file now only exports env vars and calls
+# `python3 tunnel_manager.py run` once. See that module's own module
+# docstring for the full rationale and the env var contract.
 
 name: LiveBot - {{BOT_NAME}}
 
@@ -105,6 +114,19 @@ jobs:
       - name: Clone private repo
         run: |
           git clone "https://x-access-token:${META_BOT_GITHUB_PAT}@github.com/${GITHUB_REPOSITORY_OWNER}/${PRIVATE_REPO}.git" private
+
+      - name: Print version marker
+        run: |
+          # Pass 58: explicit, deliberate version marker -- the same
+          # thing batch-template.yml prints at the top of its own
+          # member-launch step. Grep for TEMPLATE_VERSION or PRIVATE_REPO_HEAD
+          # in this run's logs to know for certain which template version
+          # dispatched this job AND which private-repo commit it cloned --
+          # answers "is this run actually on the code I just deployed"
+          # directly from the log, without inferring it from job start
+          # time or an unrelated refactor-pass comment.
+          echo "=== bot-template.yml TEMPLATE_VERSION=pass-58 BOT_NAME=${BOT_NAME} ==="
+          echo "=== PRIVATE_REPO_HEAD=$(git -C private rev-parse HEAD) (cloned $(date -u +%Y-%m-%dT%H:%M:%SZ)) ==="
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -389,140 +411,31 @@ jobs:
             --strategy {{STRATEGY_CLASS}}) &
           BOT_PID=$!
 
-          # Tunnel attach happens here, after freqtrade has been launched
-          # (not as an earlier standalone step) so cloudflared always has
-          # something listening on 8080 before it's asked to front it.
-          # Previously this ran before freqtrade even started, so the
-          # tunnel came up pointing at a closed port and every downstream
-          # "Open FreqUI" attempt failed with "No active tunnel" regardless
-          # of anything else being correct.
-          #
-          # Pass 57: no timeout at all on the port wait -- freqtrade
-          # will come up; there's nothing to give up on. The wait polls
-          # every 2s (so attach happens the instant the port opens, not
-          # delayed to some artificial chunk boundary) and logs a
-          # warning roughly once a minute while it's still waiting, but
-          # never stops waiting on its own -- only "freqtrade exited" or
-          # "port answered" end it. This is the shared bot-template.yml,
-          # so every bot launched from it gets this loop for its entire
-          # run, every handoff cycle -- not special-cased per bot.
+          # Pass 58: all Cloudflare tunnel logic (attach, hold, force-retry
+          # poll, detach) moved wholly into scripts/tunnel_manager.py --
+          # nothing tunnel-shaped is implemented in this .yml anymore. This
+          # one line replaces what was previously ~150 lines of inline bash
+          # (attach_tunnel_once, attach_tunnel_when_ready, the
+          # force_tunnel_retry poll below, and the separate Detach step).
+          # TUNNEL_WATCH_PID=$BOT_PID means the manager exits the instant
+          # freqtrade dies, matching the old "while kill -0 $BOT_PID" gating
+          # exactly. TUNNEL_CONTROL_REPO_PATH is set (live bots only, unlike
+          # batch members) so force_tunnel_retry from control.json is
+          # handled entirely inside tunnel_manager.py too -- the poll below
+          # no longer touches force_tunnel_retry at all, only
+          # stop_requested/credentials_updated_at, which are Meta-Site
+          # restart-authority concerns, not tunnel concerns.
           FREQUI_PORT=8080
-          TUNNEL_RETRY_SIGNAL_FILE="/tmp/tunnel_retry_requested"
-          rm -f "$TUNNEL_RETRY_SIGNAL_FILE"
-
-          attach_tunnel_once() {
-            # One publish attempt against an ALREADY-confirmed-ready API
-            # port. Unchanged in shape from the old inline logic (start
-            # cloudflared, poll its log for the URL, commit tunnel.json)
-            # -- only ever called once port_ready is true.
-            nohup cloudflared tunnel --url "http://localhost:${FREQUI_PORT}" > /tmp/cloudflared.log 2>&1 &
-            echo $! > /tmp/cloudflared.pid
-
-            TUNNEL_URL=""
-            for attempt in $(seq 1 20); do
-              sleep 3
-              TUNNEL_URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' /tmp/cloudflared.log | head -n1 || true)
-              if [ -n "$TUNNEL_URL" ]; then
-                break
-              fi
-            done
-
-            if [ -z "$TUNNEL_URL" ]; then
-              echo "::warning::cloudflared did not report a tunnel URL within timeout -- will retry."
-              kill "$(cat /tmp/cloudflared.pid 2>/dev/null)" 2>/dev/null || true
-              return 1
-            fi
-
-            echo "Tunnel attached: ${TUNNEL_URL}"
-            TUNNEL_BODY=$(python3 -c "import json,sys; print(json.dumps({'tunnel_url': sys.argv[1], 'bot_name': sys.argv[2]}))" "$TUNNEL_URL" "$BOT_NAME")
-            TUNNEL_B64=$(printf '%s' "$TUNNEL_BODY" | base64 -w0)
-            TUNNEL_SHA=$(curl -s -H "Authorization: token ${META_BOT_GITHUB_PAT}" \
-              -H "Accept: application/vnd.github.v3+json" \
-              "https://api.github.com/repos/${GITHUB_REPOSITORY_OWNER}/${PRIVATE_REPO}/contents/${TUNNEL_STATUS_REPO_PATH}" \
-              | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("sha","") if isinstance(d,dict) else "")' 2>/dev/null || echo "")
-            if [ -n "$TUNNEL_SHA" ]; then
-              PUT_BODY=$(python3 -c "import json,sys; print(json.dumps({'message': 'tunnel: attach', 'content': sys.argv[1], 'sha': sys.argv[2]}))" "$TUNNEL_B64" "$TUNNEL_SHA")
-            else
-              PUT_BODY=$(python3 -c "import json,sys; print(json.dumps({'message': 'tunnel: attach', 'content': sys.argv[1]}))" "$TUNNEL_B64")
-            fi
-            curl -s -X PUT \
-              -H "Authorization: token ${META_BOT_GITHUB_PAT}" \
-              -H "Accept: application/vnd.github.v3+json" \
-              "https://api.github.com/repos/${GITHUB_REPOSITORY_OWNER}/${PRIVATE_REPO}/contents/${TUNNEL_STATUS_REPO_PATH}" \
-              -d "$PUT_BODY"
-            return 0
-          }
-
-          attach_tunnel_when_ready() {
-            # Pass 57: rewritten from a "60s pass, then GIVE UP for the
-            # rest of this cycle" shape into a wait that just keeps
-            # going, in 2s polls, for as long as freqtrade is alive --
-            # no ceiling at all, since the owner's point stands:
-            # freqtrade WILL come up, so there's nothing to time out on.
-            # This still polls the port every 2s (so attach happens the
-            # instant it opens, not delayed to some chunk boundary), and
-            # still logs a warning roughly once every 60s while it
-            # waits (per the owner's explicit ask to keep that visible),
-            # it just never stops waiting on its own -- only "freqtrade
-            # exited" or "port answered" end this loop. Runs for the
-            # bot's ENTIRE lifetime, every handoff cycle, for every bot
-            # using this template -- a curl every 2s plus one log line a
-            # minute is negligible overhead against a live trading job.
-            while kill -0 "$BOT_PID" 2>/dev/null; do
-              PORT_READY="false"
-              last_warn=$(date +%s)
-              while kill -0 "$BOT_PID" 2>/dev/null; do
-                if curl -s -o /dev/null "http://localhost:${FREQUI_PORT}/api/v1/ping"; then
-                  PORT_READY="true"
-                  break
-                fi
-                # A force-retry request breaks out of the port-wait
-                # early too -- no reason to keep sitting in this poll
-                # if the user asked for an immediate attempt now.
-                if [ -f "$TUNNEL_RETRY_SIGNAL_FILE" ]; then
-                  break
-                fi
-                now=$(date +%s)
-                if [ $(( now - last_warn )) -ge 60 ]; then
-                  echo "::warning::freqtrade's API server hasn't come up on port ${FREQUI_PORT} yet -- still waiting (freqtrade is still running, no timeout -- will pick it up the instant it's ready)."
-                  last_warn=$now
-                fi
-                sleep 2
-              done
-              rm -f "$TUNNEL_RETRY_SIGNAL_FILE"
-
-              if ! kill -0 "$BOT_PID" 2>/dev/null; then
-                echo "freqtrade exited -- tunnel-attach loop stopping."
-                return
-              fi
-
-              if [ "$PORT_READY" != "true" ]; then
-                # Only reachable via a force-retry that fired before the
-                # port was actually up -- loop back and keep waiting.
-                continue
-              fi
-
-              if attach_tunnel_once; then
-                # Attached. Keep the loop alive but idle-poll less
-                # aggressively, purely to notice if cloudflared itself
-                # dies later in this same run (network blip, process
-                # OOM, etc.) or a force-retry is explicitly requested --
-                # either re-enters the attach path above.
-                while kill -0 "$BOT_PID" 2>/dev/null \
-                      && kill -0 "$(cat /tmp/cloudflared.pid 2>/dev/null)" 2>/dev/null \
-                      && [ ! -f "$TUNNEL_RETRY_SIGNAL_FILE" ]; do
-                  sleep 15
-                done
-                if [ -f "$TUNNEL_RETRY_SIGNAL_FILE" ]; then
-                  echo "Force-retry requested -- re-attaching tunnel."
-                  rm -f "$TUNNEL_RETRY_SIGNAL_FILE"
-                  kill "$(cat /tmp/cloudflared.pid 2>/dev/null)" 2>/dev/null || true
-                fi
-              fi
-            done
-          }
-
-          attach_tunnel_when_ready > /tmp/tunnel_attach.log 2>&1 &
+          TUNNEL_LOCAL_PORT="${FREQUI_PORT}" \
+          TUNNEL_STATUS_REPO_PATH="${TUNNEL_STATUS_REPO_PATH}" \
+          TUNNEL_STATUS_BOT_NAME="${BOT_NAME}" \
+          TUNNEL_STATUS_GITHUB_PAT="${META_BOT_GITHUB_PAT}" \
+          TUNNEL_STATUS_GITHUB_OWNER="${GITHUB_REPOSITORY_OWNER}" \
+          TUNNEL_STATUS_PRIVATE_REPO="${PRIVATE_REPO}" \
+          TUNNEL_WATCH_PID="${BOT_PID}" \
+          TUNNEL_CONTROL_REPO_PATH="${BOT_DIR_REPO_PATH}/control.json" \
+          TUNNEL_LOG_PREFIX="{{BOT_NAME}}" \
+          python3 "${WORKING_DIR}/scripts/tunnel_manager.py" run > /tmp/tunnel_manager.log 2>&1 &
           TUNNEL_LOOP_PID=$!
 
           PROBE_TRACKED_PIDS="freqtrade:${BOT_PID}" \
@@ -556,19 +469,11 @@ jobs:
 
             CUR_CREDENTIALS_UPDATED_AT=$(python3 -c "import sys,json,base64; d=json.load(open('/tmp/control_poll.json')); print(json.loads(base64.b64decode(d['content']).decode()).get('credentials_updated_at') or '')" 2>/dev/null || echo "")
             CUR_STOP_REQUESTED=$(python3 -c "import sys,json,base64; d=json.load(open('/tmp/control_poll.json')); print('true' if json.loads(base64.b64decode(d['content']).decode()).get('stop_requested') else 'false')" 2>/dev/null || echo "false")
-            # Pass 56: "Force retry" button on the bot's page writes
-            # force_tunnel_retry=true to control.json. Detected here on
-            # the same 5-minute poll as stop_requested/credentials --
-            # dropping the signal file wakes attach_tunnel_when_ready
-            # immediately (it polls for this file every 2s during its
-            # own port-wait, and checks it every 15s once already
-            # attached), rather than waiting for that loop's own natural
-            # retry cadence. The flag is cleared back to false in
-            # control.json right away so it behaves as a one-shot
-            # request, not a standing "always force" state -- consistent
-            # with how stop_requested itself is a momentary signal, not
-            # a persisted mode.
-            CUR_FORCE_TUNNEL_RETRY=$(python3 -c "import sys,json,base64; d=json.load(open('/tmp/control_poll.json')); print('true' if json.loads(base64.b64decode(d['content']).decode()).get('force_tunnel_retry') else 'false')" 2>/dev/null || echo "false")
+            # Pass 58: force_tunnel_retry handling REMOVED from this poll --
+            # tunnel_manager.py now polls TUNNEL_CONTROL_REPO_PATH
+            # (this bot's own control.json) for that field itself, on its
+            # own TUNNEL_CONTROL_POLL_SECONDS cadence, entirely independent
+            # of this 5-minute loop. See the tunnel_manager.py launch above.
 
             if [ "$CUR_STOP_REQUESTED" = "true" ]; then
               echo "stop_requested=true in control.json -- Meta-Site has claimed restart authority for a graceful stop (pause/delete). Stopping cleanly, no successor will be primed."
@@ -576,22 +481,6 @@ jobs:
               wait "$BOT_PID" 2>/dev/null || true
               EXIT_SENTINEL="stop_requested"
               break
-            fi
-
-            if [ "$CUR_FORCE_TUNNEL_RETRY" = "true" ]; then
-              echo "force_tunnel_retry=true in control.json -- signaling the tunnel-attach loop to retry now."
-              touch "$TUNNEL_RETRY_SIGNAL_FILE"
-              CONTROL_SHA=$(python3 -c "import sys,json; d=json.load(open('/tmp/control_poll.json')); print(d.get('sha',''))" 2>/dev/null || echo "")
-              CONTROL_JSON=$(python3 -c "import sys,json,base64; d=json.load(open('/tmp/control_poll.json')); h=json.loads(base64.b64decode(d['content']).decode()); h['force_tunnel_retry']=False; print(json.dumps(h))" 2>/dev/null || echo "")
-              if [ -n "$CONTROL_JSON" ] && [ -n "$CONTROL_SHA" ]; then
-                CONTROL_B64=$(printf '%s' "$CONTROL_JSON" | base64 -w0)
-                CLEAR_BODY=$(python3 -c "import json,sys; print(json.dumps({'message': 'bot: consume force_tunnel_retry', 'content': sys.argv[1], 'sha': sys.argv[2]}))" "$CONTROL_B64" "$CONTROL_SHA")
-                curl -s -X PUT \
-                  -H "Authorization: token ${META_BOT_GITHUB_PAT}" \
-                  -H "Accept: application/vnd.github.v3+json" \
-                  "https://api.github.com/repos/${GITHUB_REPOSITORY_OWNER}/${PRIVATE_REPO}/contents/${BOT_DIR_REPO_PATH}/control.json" \
-                  -d "$CLEAR_BODY" > /dev/null || echo "::warning::failed to clear force_tunnel_retry in control.json -- harmless, it'll just be re-consumed (a no-op) on the next poll."
-              fi
             fi
 
             _time_left=$(( END_TIME - $(date +%s) ))
@@ -631,8 +520,13 @@ jobs:
 
           kill "$BOT_PID" 2>/dev/null || true
           wait "$BOT_PID" 2>/dev/null || true
-          kill "$TUNNEL_LOOP_PID" 2>/dev/null || true
-          kill "$(cat /tmp/cloudflared.pid 2>/dev/null)" 2>/dev/null || true
+          # Pass 58: SIGTERM (not SIGKILL) so tunnel_manager.py's own
+          # signal handler runs and it kills its cloudflared child cleanly
+          # before exiting, instead of relying solely on the separate
+          # Detach step below (kept as a belt-and-suspenders always()
+          # backstop in case this kill races the process exiting on its
+          # own from BOT_PID dying first).
+          kill -TERM "$TUNNEL_LOOP_PID" 2>/dev/null || true
           kill "$PROBE_PID" 2>/dev/null || true
 
           echo "exit_sentinel=${EXIT_SENTINEL}" >> "$GITHUB_OUTPUT"
@@ -668,11 +562,18 @@ jobs:
               -d "$BODY"
           fi
 
-      - name: Detach Cloudflare Quick Tunnel
+      - name: Detach Cloudflare Quick Tunnel (backstop)
         if: always()
         run: |
-          if [ -f /tmp/cloudflared.pid ]; then
-            kill "$(cat /tmp/cloudflared.pid)" 2>/dev/null || true
+          # Pass 58: tunnel_manager.py kills its own cloudflared child on
+          # SIGTERM/exit (see attach_and_hold's cleanup path) -- this step
+          # is now just a belt-and-suspenders backstop for the rare case
+          # where the process above was killed before it could run its own
+          # cleanup. cloudflared writes its own pidfile per BOT_NAME, same
+          # naming scheme tunnel_manager.py itself uses, so this stays a
+          # correct catch-all even though tunnel_manager.py is the real owner.
+          if [ -f "/tmp/cloudflared_${BOT_NAME}.pid" ]; then
+            kill "$(cat "/tmp/cloudflared_${BOT_NAME}.pid")" 2>/dev/null || true
           fi
 
       - name: Schedule next run

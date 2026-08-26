@@ -105,6 +105,13 @@ jobs:
         run: |
           git clone "https://x-access-token:${META_BOT_GITHUB_PAT}@github.com/${GITHUB_REPOSITORY_OWNER}/${PRIVATE_REPO}.git" private
 
+      - name: Print version marker
+        run: |
+          # Pass 58: see bot-template.yml's own "Print version marker"
+          # step for the full rationale -- same contract here, batch-scoped.
+          echo "=== batch-template.yml TEMPLATE_VERSION=pass-58 BATCH_ID={{BATCH_ID}} ==="
+          echo "=== PRIVATE_REPO_HEAD=$(git -C private rev-parse HEAD) (cloned $(date -u +%Y-%m-%dT%H:%M:%SZ)) ==="
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -378,6 +385,16 @@ jobs:
         if: steps.members.outputs.member_count != '0' && (env.HANDOFF_MODE != 'primer' || steps.primer_mode.outputs.got_go == 'true')
         id: run_members
         run: |
+          # Pass 58: explicit, deliberate version marker -- printed as a
+          # real command (not left as incidental comment text that only
+          # shows up in the log because it happened to be the first
+          # line of a run: block, which is how earlier "Pass N" comments
+          # ended up visible here and caused confusion about which pass
+          # was actually running). This line is the one thing to grep
+          # for, or read at a glance, to know for certain which template
+          # version dispatched this specific job run.
+          echo "=== batch-template.yml TEMPLATE_VERSION=pass-58 ==="
+
           # Pass 54: extracted to scripts/parse_member_launch_list.py
           # (was an inline python3 -c). Logic unchanged, only where it
           # lives changed -- see the "Launch member processes" step's
@@ -456,27 +473,38 @@ jobs:
                 # 'live' branch here launched freqtrade directly with no
                 # tunnel step at all, so every batched live bot's FreqUI
                 # was permanently unreachable regardless of freqtrade's
-                # own health. This mirrors bot-template.yml's own
-                # attach block (install already happened once at
-                # workflow setup, shared across all members), but every
-                # path/port that would collide across N members sharing
-                # one runner is namespaced by BOT_NAME (see
-                # scripts/attach_tunnel.sh for the pidfile/log/--metrics
-                # namespacing detail).
-                # Pass 54: extracted to scripts/attach_tunnel.sh -- this
-                # ~90-line inline subshell was, together with the
-                # secrets/config builder and mark_bot_ready_in_handoff
-                # below, why this step's total run: content exceeded
-                # GitHub Actions' 21,000-char expression-length ceiling
-                # ("Exceeded max expression length 21000" at pass 53).
-                # Logic is byte-for-byte identical, only where it lives
-                # changed. Still backgrounded with its own `&` so it
-                # never blocks this member's own launch loop iteration.
-                BATCH_ID_LABEL="{{BATCH_ID}}" \
-                META_BOT_GITHUB_PAT="${META_BOT_GITHUB_PAT}" \
-                GITHUB_REPOSITORY_OWNER="${GITHUB_REPOSITORY_OWNER}" \
-                PRIVATE_REPO="${PRIVATE_REPO}" \
-                bash "${WORKING_DIR}/scripts/attach_tunnel.sh" "$BOT_NAME" "$ENTRY_PORT" "$BOT_DIR_REPO_PATH" &
+                # own health. Every path/port that would collide across
+                # N members sharing one runner is namespaced by BOT_NAME
+                # (tunnel_manager.py does this itself now -- see its
+                # cf_log_path/cf_pid_path construction).
+                #
+                # Pass 58: replaces scripts/attach_tunnel.sh (the pass-54
+                # extraction of what was pass-52's inline subshell) with
+                # the same shared scripts/tunnel_manager.py that
+                # bot-template.yml now uses -- see that module's docstring
+                # for the full rationale. attach_tunnel.sh no longer
+                # exists; this is the one tunnel implementation for every
+                # 'live' bot in the codebase, standalone or batched.
+                # TUNNEL_WATCH_PID is this member's own freqtrade PID
+                # (${PIDS[$BOT_NAME]}, just assigned above), so the
+                # manager exits with this specific member, not the whole
+                # batch. TUNNEL_CONTROL_REPO_PATH is intentionally left
+                # UNSET here (batch members have no per-member control.json
+                # force_tunnel_retry concept, matching pre-pass-58 behavior
+                # where attach_tunnel.sh never had a retry poll at all --
+                # only bot-template.yml's standalone live bots did).
+                # TUNNEL_LOG_PREFIX includes the batch ID so a batch run's
+                # single interleaved log stream stays attributable per
+                # member at a glance, not just per bot name.
+                TUNNEL_LOCAL_PORT="${ENTRY_PORT}" \
+                TUNNEL_STATUS_REPO_PATH="${BOT_DIR_REPO_PATH}/tunnel.json" \
+                TUNNEL_STATUS_BOT_NAME="${BOT_NAME}" \
+                TUNNEL_STATUS_GITHUB_PAT="${META_BOT_GITHUB_PAT}" \
+                TUNNEL_STATUS_GITHUB_OWNER="${GITHUB_REPOSITORY_OWNER}" \
+                TUNNEL_STATUS_PRIVATE_REPO="${PRIVATE_REPO}" \
+                TUNNEL_WATCH_PID="${PIDS[$BOT_NAME]}" \
+                TUNNEL_LOG_PREFIX="{{BATCH_ID}}/${BOT_NAME}" \
+                python3 "${WORKING_DIR}/scripts/tunnel_manager.py" run > "/tmp/tunnel_manager_${BOT_NAME}.log" 2>&1 &
                 TUNNEL_PIDS["$BOT_NAME"]=$!
               fi
             else
@@ -715,14 +743,15 @@ jobs:
             wait "${PIDS[$BOT_NAME]}" 2>/dev/null || true
           done
           # Pass 52: detach every member's own Cloudflare Quick Tunnel
-          # (see TUNNEL_PIDS's own declaration comment). Killing the
-          # sidecar subshell's PID is enough -- it's the direct parent
-          # of the `nohup cloudflared ... &` call, and cloudflared
-          # itself is what actually holds the tunnel open, but leaving
-          # freqtrade's own process dead with a stale tunnel pointed at
-          # a now-closed port is worse than tearing both down together
-          # on every exit path (always(), same as the standalone
-          # template's own Detach step).
+          # (see TUNNEL_PIDS's own declaration comment). Pass 58: the
+          # killed PID is now tunnel_manager.py itself (not a bash
+          # subshell) -- `kill` sends SIGTERM, which its own signal
+          # handler catches to kill its cloudflared child cleanly before
+          # exiting (see tunnel_manager.py's attach_and_hold cleanup
+          # path). The pidfile kill just below is a belt-and-suspenders
+          # backstop, same reasoning as bot-template.yml's own backstop
+          # Detach step, for the case where this kill races the process
+          # dying on its own from PIDS[$BOT_NAME] exiting first.
           for BOT_NAME in "${!TUNNEL_PIDS[@]}"; do
             kill "${TUNNEL_PIDS[$BOT_NAME]}" 2>/dev/null || true
             if [ -f "/tmp/cloudflared_${BOT_NAME}.pid" ]; then
