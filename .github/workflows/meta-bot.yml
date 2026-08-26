@@ -1,0 +1,72 @@
+name: Meta-Bot
+
+# Pass 1 scope: this workflow is the BOOTSTRAP check only.
+# It clones the private repo and confirms the Next.js app under
+# meta_site_app/ installs and builds cleanly on a fresh runner.
+# It does NOT yet run any persistent controller process — see the
+# "THE META-SITE CONTROLLER'S OWN WORKFLOW" note in the planning
+# prompt: a persistent Actions-hosted controller is explicitly
+# deferred until a later pass identifies concrete work that doesn't
+# fit Vercel's serverless request/response model. This file will be
+# extended in that later pass, not replaced.
+#
+# Manual trigger only for Pass 1. The repository_dispatch event types
+# below are reserved now (per the primer/handoff pattern used
+# throughout this project) so later passes can wire the real
+# controller loop in without renaming anything.
+#
+# Restored as of Pass 28 (this file was missing from .github/workflows/
+# entirely — see Fix 4 in the corresponding session notes). Content is
+# Pass 1's original bootstrap check, updated for two real changes since
+# Pass 1: the private repo now clones to `private-repo/` (not `private/`,
+# matching every other template's WORKING_DIR convention), and
+# package-lock.json now exists, so install uses `npm ci` for a
+# reproducible, lockfile-exact install rather than `npm install`.
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [restart-meta-bot, prime-meta-bot]
+
+concurrency:
+  group: ${{ github.event.action == 'prime-meta-bot' && 'meta-bot-primer' || 'meta-bot' }}
+  cancel-in-progress: true
+
+jobs:
+  bootstrap-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Clone private repo
+        env:
+          FREQTRADE_CORE_PAT: ${{ secrets.FREQTRADE_CORE_PAT }}
+          PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
+        run: |
+          set -e
+          REPO_NAME="${PRIVATE_REPO_NAME:-Miadol}"
+          echo "Cloning private repo: ${REPO_NAME}"
+          git clone "https://x-access-token:${FREQTRADE_CORE_PAT}@github.com/${{ github.repository_owner }}/${REPO_NAME}.git" private-repo
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: private-repo/meta_site_app/package-lock.json
+
+      - name: Install Meta-Site app dependencies
+        working-directory: private-repo/meta_site_app
+        run: npm ci
+
+      - name: Build Meta-Site app (sanity check only)
+        working-directory: private-repo/meta_site_app
+        run: npm run build
+
+      - name: Bootstrap check summary
+        run: |
+          echo "Private repo cloned successfully."
+          echo "Next.js app under meta_site_app/ installs and builds cleanly."
+          echo "Bootstrap check complete. No persistent controller process runs here."
