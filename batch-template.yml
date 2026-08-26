@@ -742,7 +742,7 @@ jobs:
           done < /tmp/member_names.txt
 
       - name: Schedule next run
-        if: always() && (env.HANDOFF_MODE != 'primer' || steps.primer_mode.outputs.got_go == 'true')
+        if: always() && steps.members.outputs.member_count != '0' && (env.HANDOFF_MODE != 'primer' || steps.primer_mode.outputs.got_go == 'true')
         run: |
           EXIT_SENTINEL=$(cat /tmp/exit_sentinel.txt 2>/dev/null || echo "")
           if [ "$EXIT_SENTINEL" = "handoff_yielded" ]; then
