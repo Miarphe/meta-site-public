@@ -109,7 +109,7 @@ jobs:
         run: |
           # Pass 58: see bot-template.yml's own "Print version marker"
           # step for the full rationale -- same contract here, batch-scoped.
-          echo "=== batch-template.yml TEMPLATE_VERSION=pass-60 BATCH_ID={{BATCH_ID}} ==="
+          echo "=== batch-template.yml TEMPLATE_VERSION=pass-61 BATCH_ID={{BATCH_ID}} ==="
           echo "=== PRIVATE_REPO_HEAD=$(git -C private rev-parse HEAD) (cloned $(date -u +%Y-%m-%dT%H:%M:%SZ)) ==="
 
       - name: Set up Python
@@ -393,7 +393,7 @@ jobs:
           # was actually running). This line is the one thing to grep
           # for, or read at a glance, to know for certain which template
           # version dispatched this specific job run.
-          echo "=== batch-template.yml TEMPLATE_VERSION=pass-60 ==="
+          echo "=== batch-template.yml TEMPLATE_VERSION=pass-61 ==="
 
           # Pass 54: extracted to scripts/parse_member_launch_list.py
           # (was an inline python3 -c). Logic unchanged, only where it
