@@ -98,6 +98,15 @@ jobs:
       WORKING_DIR: ${{ github.workspace }}/private/freqtrade-core
       MAX_BATCH_MEM_MB: 4096
     steps:
+      - name: Print version marker (template)
+        run: |
+          # Pass 62: moved to be the FIRST step in the job -- see
+          # bot-template.yml's own "Print version marker (template)"
+          # step for the full rationale (same split: this half needs
+          # nothing and runs before checkout; the PRIVATE_REPO_HEAD
+          # half stays after clone below, since it needs that first).
+          echo "=== batch-template.yml TEMPLATE_VERSION=pass-62 BATCH_ID={{BATCH_ID}} ==="
+
       - name: Checkout public repo
         uses: actions/checkout@v4
 
@@ -105,11 +114,10 @@ jobs:
         run: |
           git clone "https://x-access-token:${META_BOT_GITHUB_PAT}@github.com/${GITHUB_REPOSITORY_OWNER}/${PRIVATE_REPO}.git" private
 
-      - name: Print version marker
+      - name: Print version marker (private repo HEAD)
         run: |
-          # Pass 58: see bot-template.yml's own "Print version marker"
-          # step for the full rationale -- same contract here, batch-scoped.
-          echo "=== batch-template.yml TEMPLATE_VERSION=pass-61 BATCH_ID={{BATCH_ID}} ==="
+          # See "Print version marker (template)" above, first step in
+          # this job, for the full rationale.
           echo "=== PRIVATE_REPO_HEAD=$(git -C private rev-parse HEAD) (cloned $(date -u +%Y-%m-%dT%H:%M:%SZ)) ==="
 
       - name: Set up Python
@@ -127,6 +135,10 @@ jobs:
             pip install freqtrade
           fi
           pip install requests
+          # Pass 62: see bot-template.yml's own "Install Freqtrade" step
+          # for the full rationale -- same fix here, since batch members
+          # share this exact same UI-serving/tunnel setup per-member.
+          freqtrade install-ui
 
       # Pass 52 FOLLOW-UP: this step was missing entirely in the
       # original Pass 52 -- the 'live' member launch loop's tunnel
@@ -393,7 +405,7 @@ jobs:
           # was actually running). This line is the one thing to grep
           # for, or read at a glance, to know for certain which template
           # version dispatched this specific job run.
-          echo "=== batch-template.yml TEMPLATE_VERSION=pass-61 ==="
+          echo "=== batch-template.yml TEMPLATE_VERSION=pass-62 ==="
 
           # Pass 54: extracted to scripts/parse_member_launch_list.py
           # (was an inline python3 -c). Logic unchanged, only where it

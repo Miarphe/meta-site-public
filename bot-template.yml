@@ -108,6 +108,21 @@ jobs:
       HANDOFF_MODE: ${{ github.event.action == 'prime-bot-{{BOT_NAME}}' && 'primer' || 'normal' }}
       TUNNEL_STATUS_REPO_PATH: freqtrade-core/user_data/live_bots/{{BOT_NAME}}/tunnel.json
     steps:
+      - name: Print version marker (template)
+        run: |
+          # Pass 62: moved to be the FIRST step in the job, before even
+          # checkout -- per explicit request, so the version is visible
+          # at a glance at the top of the log without scrolling or
+          # searching. This line needs nothing except the template
+          # itself, so nothing else has to run first. The companion
+          # PRIVATE_REPO_HEAD line (which DOES need the private repo
+          # cloned first) stays where it is, right after "Clone private
+          # repo" below -- together the two lines still answer both
+          # "which template version dispatched this" and "which
+          # private-repo commit did it clone", just split across the
+          # earliest point each one can actually run at.
+          echo "=== bot-template.yml TEMPLATE_VERSION=pass-62 BOT_NAME=${BOT_NAME} ==="
+
       - name: Checkout public repo
         uses: actions/checkout@v4
 
@@ -115,17 +130,12 @@ jobs:
         run: |
           git clone "https://x-access-token:${META_BOT_GITHUB_PAT}@github.com/${GITHUB_REPOSITORY_OWNER}/${PRIVATE_REPO}.git" private
 
-      - name: Print version marker
+      - name: Print version marker (private repo HEAD)
         run: |
-          # Pass 58: explicit, deliberate version marker -- the same
-          # thing batch-template.yml prints at the top of its own
-          # member-launch step. Grep for TEMPLATE_VERSION or PRIVATE_REPO_HEAD
-          # in this run's logs to know for certain which template version
-          # dispatched this job AND which private-repo commit it cloned --
-          # answers "is this run actually on the code I just deployed"
-          # directly from the log, without inferring it from job start
-          # time or an unrelated refactor-pass comment.
-          echo "=== bot-template.yml TEMPLATE_VERSION=pass-61 BOT_NAME=${BOT_NAME} ==="
+          # See "Print version marker (template)" above, first step in
+          # this job, for the full rationale. This half needs the clone
+          # above to have happened first, which is why it can't also be
+          # the very first step -- it's still as early as it can be.
           echo "=== PRIVATE_REPO_HEAD=$(git -C private rev-parse HEAD) (cloned $(date -u +%Y-%m-%dT%H:%M:%SZ)) ==="
 
       - name: Set up Python
@@ -143,6 +153,21 @@ jobs:
             pip install freqtrade
           fi
           pip install requests
+          # Pass 62: freqtrade's own web UI (the FreqUI static files
+          # served at the tunnel URL) is a SEPARATE install step from
+          # the freqtrade package itself -- `pip install freqtrade`
+          # gives you the API server, but the UI assets it serves are
+          # fetched on demand via `freqtrade install-ui`, which was
+          # never called anywhere in this codebase. Effect in practice:
+          # the tunnel attached correctly, published correctly, and
+          # proxied correctly to a genuinely running freqtrade instance
+          # -- but that instance answered every request with its own
+          # built-in "Freqtrade UI not installed" page, because the UI
+          # files were never fetched. This looked like a tunnel
+          # problem (it's the tunnel URL that shows the error) but was
+          # never one -- the tunnel was working exactly as designed the
+          # whole time.
+          freqtrade install-ui
 
       - name: Download DB artifact
         id: db_artifact
