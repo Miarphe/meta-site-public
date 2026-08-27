@@ -125,7 +125,7 @@ jobs:
           # answers "is this run actually on the code I just deployed"
           # directly from the log, without inferring it from job start
           # time or an unrelated refactor-pass comment.
-          echo "=== bot-template.yml TEMPLATE_VERSION=pass-58 BOT_NAME=${BOT_NAME} ==="
+          echo "=== bot-template.yml TEMPLATE_VERSION=pass-60 BOT_NAME=${BOT_NAME} ==="
           echo "=== PRIVATE_REPO_HEAD=$(git -C private rev-parse HEAD) (cloned $(date -u +%Y-%m-%dT%H:%M:%SZ)) ==="
 
       - name: Set up Python
