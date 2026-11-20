@@ -1,0 +1,262 @@
+name: AOT cloud build
+run-name: aot ${{ inputs.job }} ${{ inputs.release_id }}
+on:
+  workflow_dispatch:
+    inputs:
+      job:
+        description: build or sign
+        required: true
+        default: build
+      release_id:
+        description: draft release id
+        required: true
+      pub_tag:
+        description: publish tag
+        required: false
+        default: ""
+      sealed:
+        description: wait for sealed assets
+        required: false
+        default: "false"
+      runner:
+        description: runner label
+        required: false
+        default: "ubuntu-24.04"
+      kind:
+        description: kotlin, flutter or godot
+        required: false
+        default: "kotlin"
+permissions:
+  contents: write
+defaults:
+  run:
+    shell: bash
+env:
+  AOT_CLOUD_VERSION: "24"
+  GH_TOKEN: ${{ github.token }}
+  REL: ${{ inputs.release_id }}
+  PUB_TAG: ${{ inputs.pub_tag }}
+  SEALED: ${{ inputs.sealed }}
+  BT: "36.0.0"
+  FLUTTER_VERSION: "3.35.7"
+jobs:
+  build:
+    if: ${{ inputs.job == 'build' && inputs.kind != 'flutter' && inputs.kind != 'godot' }}
+    runs-on: ${{ inputs.runner || 'ubuntu-24.04' }}
+    timeout-minutes: 60
+    steps:
+      - name: Prepare checkout
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github
+      - name: Prepare tools
+        if: runner.os == 'Windows'
+        run: |
+          mkdir -p "$RUNNER_TEMP/shims"
+          printf '#!/usr/bin/env bash\nexec python "$@"\n' > "$RUNNER_TEMP/shims/python3"
+          printf '#!/usr/bin/env bash\nexec gradle.bat "$@"\n' > "$RUNNER_TEMP/shims/gradle"
+          cygpath -w "$RUNNER_TEMP/shims" >> "$GITHUB_PATH"
+      - name: Prepare java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Prepare gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.14.3"
+      - name: Prepare sdk
+        env:
+          SDKM: ${{ runner.os == 'Windows' && 'sdkmanager.bat' || 'sdkmanager' }}
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/$SDKM" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/$SDKM" "platforms;android-36" "build-tools;$BT" > /dev/null
+      - name: Prepare source
+        run: |
+          python3 -m pip install --quiet cryptography
+          python3 .github/aot/aot_cloud.py fetch
+          if [ "$SEALED" = "true" ]; then python3 .github/aot/aot_cloud.py seal seal-assets.enc apply; fi
+          python3 .github/aot/aot_gradle_gen.py proj build-facts.txt
+      - name: Prepare game
+        run: python3 .github/aot/aot_game.py vendor
+      - name: Prepare asset facts
+        run: echo "BLENDER_VERSION=$(python3 .github/aot/aot_assets.py version)" >> "$GITHUB_ENV"
+      - name: Cache assets
+        if: ${{ env.BLENDER_VERSION != '' }}
+        uses: actions/cache@v4
+        with:
+          path: ~/aot-cache
+          key: aot-assets-${{ env.BLENDER_VERSION }}-${{ hashFiles('proj/assets_src/**') }}
+          restore-keys: aot-assets-${{ env.BLENDER_VERSION }}-
+      - name: Prepare assets
+        run: python3 .github/aot/aot_assets.py run
+      - name: Prepare facts
+        run: python3 .github/aot/aot_cloud.py env-facts
+      - name: Resources
+        working-directory: proj
+        run: gradle processDebugResources processReleaseResources --console=plain > "$GITHUB_WORKSPACE/build.log" 2>&1
+      - name: Compile
+        working-directory: proj
+        run: python3 "$GITHUB_WORKSPACE/.github/aot/aot_cloud.py" compile
+      - name: Dex
+        working-directory: proj
+        run: python3 "$GITHUB_WORKSPACE/.github/aot/aot_cloud.py" gradle dex minifyReleaseWithR8 dexBuilderDebug
+      - name: Package
+        working-directory: proj
+        run: python3 "$GITHUB_WORKSPACE/.github/aot/aot_cloud.py" gradle package assembleDebug assembleRelease bundleRelease
+      - name: Game smoke
+        continue-on-error: true
+        run: python3 .github/aot/aot_game.py smoke
+      - name: Upload
+        run: python3 .github/aot/aot_cloud.py finish-build
+      - name: Sign
+        run: python3 .github/aot/aot_cloud.py sign-inline
+      - name: Report failure
+        if: ${{ failure() }}
+        run: python3 .github/aot/aot_cloud.py fail
+  flutter:
+    if: ${{ inputs.job == 'build' && inputs.kind == 'flutter' }}
+    runs-on: ${{ inputs.runner || 'ubuntu-24.04' }}
+    timeout-minutes: 90
+    steps:
+      - name: Prepare checkout
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github
+      - name: Prepare java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Prepare sdk
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-36" "build-tools;$BT" > /dev/null
+      - name: Prepare flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+          pub-cache-key: aot-pub-${{ env.FLUTTER_VERSION }}
+      - name: Prepare source
+        run: |
+          python3 -m pip install --quiet cryptography
+          python3 .github/aot/aot_cloud.py fetch
+          if [ "$SEALED" = "true" ]; then python3 .github/aot/aot_cloud.py seal seal-assets.enc apply; fi
+      - name: Prepare game
+        run: python3 .github/aot/aot_game.py vendor
+      - name: Prepare asset facts
+        run: echo "BLENDER_VERSION=$(python3 .github/aot/aot_assets.py version)" >> "$GITHUB_ENV"
+      - name: Cache assets
+        if: ${{ env.BLENDER_VERSION != '' }}
+        uses: actions/cache@v4
+        with:
+          path: ~/aot-cache
+          key: aot-assets-${{ env.BLENDER_VERSION }}-${{ hashFiles('proj/assets_src/**') }}
+          restore-keys: aot-assets-${{ env.BLENDER_VERSION }}-
+      - name: Prepare assets
+        run: python3 .github/aot/aot_assets.py run
+      - name: Prepare facts
+        run: python3 .github/aot/aot_cloud.py env-facts
+      - name: Compile
+        run: python3 .github/aot/aot_flutter_build.py project
+      - name: Check 16 KB
+        run: python3 .github/aot/aot_game.py apkcheck
+      - name: Upload
+        run: python3 .github/aot/aot_cloud.py finish-build
+      - name: Sign
+        run: python3 .github/aot/aot_cloud.py sign-inline
+      - name: Report failure
+        if: ${{ failure() }}
+        run: python3 .github/aot/aot_cloud.py fail
+  godot:
+    if: ${{ inputs.job == 'build' && inputs.kind == 'godot' }}
+    runs-on: ${{ inputs.runner || 'ubuntu-24.04' }}
+    timeout-minutes: 90
+    steps:
+      - name: Prepare checkout
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github
+      - name: Prepare java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Prepare sdk
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-36" "build-tools;$BT" > /dev/null
+      - name: Prepare source
+        run: |
+          python3 -m pip install --quiet cryptography
+          python3 .github/aot/aot_cloud.py fetch
+          if [ "$SEALED" = "true" ]; then python3 .github/aot/aot_cloud.py seal seal-assets.enc apply; fi
+      - name: Prepare godot facts
+        run: echo "GODOT_VERSION=$(python3 .github/aot/aot_godot_build.py version)" >> "$GITHUB_ENV"
+      - name: Cache godot
+        if: ${{ env.GODOT_VERSION != '' }}
+        uses: actions/cache@v4
+        with:
+          path: ~/aot-godot
+          key: aot-godot-${{ env.GODOT_VERSION }}
+      - name: Prepare game
+        run: python3 .github/aot/aot_game.py vendor
+      - name: Prepare asset facts
+        run: echo "BLENDER_VERSION=$(python3 .github/aot/aot_assets.py version)" >> "$GITHUB_ENV"
+      - name: Cache assets
+        if: ${{ env.BLENDER_VERSION != '' }}
+        uses: actions/cache@v4
+        with:
+          path: ~/aot-cache
+          key: aot-assets-${{ env.BLENDER_VERSION }}-${{ hashFiles('proj/assets_src/**') }}
+          restore-keys: aot-assets-${{ env.BLENDER_VERSION }}-
+      - name: Prepare assets
+        run: python3 .github/aot/aot_assets.py run
+      - name: Prepare facts
+        run: python3 .github/aot/aot_cloud.py env-facts
+      - name: Compile
+        run: python3 .github/aot/aot_godot_build.py project
+      - name: Check 16 KB
+        run: python3 .github/aot/aot_game.py apkcheck
+      - name: Upload
+        run: python3 .github/aot/aot_cloud.py finish-build
+      - name: Sign
+        run: python3 .github/aot/aot_cloud.py sign-inline
+      - name: Report failure
+        if: ${{ failure() }}
+        run: python3 .github/aot/aot_cloud.py fail
+  sign:
+    if: ${{ inputs.job == 'sign' }}
+    runs-on: ${{ inputs.runner || 'ubuntu-24.04' }}
+    timeout-minutes: 20
+    steps:
+      - name: Prepare checkout
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github
+      - name: Prepare tools
+        if: runner.os == 'Windows'
+        run: |
+          mkdir -p "$RUNNER_TEMP/shims"
+          printf '#!/usr/bin/env bash\nexec python "$@"\n' > "$RUNNER_TEMP/shims/python3"
+          printf '#!/usr/bin/env bash\nexec gradle.bat "$@"\n' > "$RUNNER_TEMP/shims/gradle"
+          cygpath -w "$RUNNER_TEMP/shims" >> "$GITHUB_PATH"
+      - name: Prepare java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Prepare sdk
+        env:
+          SDKM: ${{ runner.os == 'Windows' && 'sdkmanager.bat' || 'sdkmanager' }}
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/$SDKM" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/$SDKM" "build-tools;$BT" > /dev/null
+          python3 -m pip install --quiet cryptography
+      - name: Sign
+        run: python3 .github/aot/aot_cloud.py sign
+      - name: Report failure
+        if: ${{ failure() }}
+        run: python3 .github/aot/aot_cloud.py fail
