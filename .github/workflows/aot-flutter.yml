@@ -1,0 +1,52 @@
+name: AOT flutter
+run-name: aot flutter ${{ inputs.release_id }}
+on:
+  workflow_dispatch:
+    inputs:
+      release_id:
+        description: draft release id
+        required: true
+      abis:
+        description: target platforms
+        required: false
+        default: "android-arm,android-arm64"
+permissions:
+  contents: write
+defaults:
+  run:
+    shell: bash
+env:
+  AOT_FLUTTER_VERSION: "2"
+  GH_TOKEN: ${{ github.token }}
+  REL: ${{ inputs.release_id }}
+  FLUTTER_VERSION: "3.35.7"
+  AOT_ABIS: ${{ inputs.abis || 'android-arm,android-arm64' }}
+jobs:
+  spike:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Prepare checkout
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github
+      - name: Prepare java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Prepare flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+          pub-cache-key: aot-pub-${{ env.FLUTTER_VERSION }}
+      - name: Build
+        run: python3 .github/aot/aot_flutter_build.py
+      - name: Upload
+        if: ${{ always() }}
+        run: |
+          for f in hello-release.apk flutter-build-status.json pubspec.lock; do
+            if [ -f "$f" ]; then gh release upload "$REL" "$f" --repo "$GITHUB_REPOSITORY" --clobber; fi
+          done
