@@ -1,0 +1,139 @@
+name: AOT recover
+run-name: aot recover ${{ inputs.release_id }}
+on:
+  workflow_dispatch:
+    inputs:
+      release_id:
+        description: draft release id
+        required: true
+      runner:
+        description: runner label
+        required: false
+        default: "ubuntu-24.04"
+      flutter:
+        description: read the Dart snapshot
+        required: false
+        default: "false"
+permissions:
+  contents: write
+defaults:
+  run:
+    shell: bash
+env:
+  AOT_RECOVER_VERSION: "16"
+  GH_TOKEN: ${{ github.token }}
+  REL: ${{ inputs.release_id }}
+  JADX_VERSION: "1.5.2"
+  JADX_SHA256: ""
+jobs:
+  recover:
+    runs-on: ${{ inputs.runner || 'ubuntu-24.04' }}
+    timeout-minutes: 90
+    steps:
+      - name: Prepare checkout
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github
+      - name: Prepare java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Prepare jadx
+        run: python3 .github/aot/aot_recover.py tool
+      - name: Fetch
+        run: python3 .github/aot/aot_recover.py fetch
+      - name: Decompile
+        run: python3 .github/aot/aot_recover.py decompile
+      - name: Pack
+        run: python3 .github/aot/aot_recover.py pack
+      - name: Report failure
+        if: ${{ failure() }}
+        run: python3 .github/aot/aot_recover.py fail
+  flutter:
+    if: ${{ inputs.flutter == 'true' }}
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    timeout-minutes: 150
+    env:
+      BLUTTER_REF: main
+    steps:
+      - name: Prepare checkout
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github
+      - name: Prepare tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-pyelftools python3-requests git cmake ninja-build build-essential pkg-config libicu-dev libcapstone-dev
+          python3 .github/aot/aot_flutter.py tool
+      - name: Fetch
+        id: fetch
+        run: python3 .github/aot/aot_flutter.py fetch
+      - name: Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            blutter/build
+            blutter/dartsdk
+            blutter/packages
+            blutter/bin
+          key: blutter-${{ steps.fetch.outputs.dart }}-${{ steps.fetch.outputs.blutter }}
+      - name: Blutter
+        run: python3 .github/aot/aot_flutter.py run
+      - name: Pick the reference Flutter version
+        id: ref
+        continue-on-error: true
+        run: python3 .github/aot/aot_flutter_ref.py pick
+      - name: Prepare flutter for the reference build and the Dart check
+        continue-on-error: true
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ steps.ref.outputs.flutter || '3.35.7' }}
+          channel: stable
+          cache: true
+      - name: Reference build
+        continue-on-error: true
+        run: python3 .github/aot/aot_flutter_ref.py build
+      - name: Older build
+        continue-on-error: true
+        run: python3 .github/aot/aot_flutter_ref.py older
+      - name: Pack
+        run: python3 .github/aot/aot_flutter.py pack
+      - name: Report failure
+        if: ${{ failure() }}
+        run: python3 .github/aot/aot_flutter.py fail
+  aotopsy:
+    if: ${{ inputs.flutter == 'true' }}
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    timeout-minutes: 150
+    steps:
+      - name: Prepare checkout
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github
+      - name: Prepare AOTopsy
+        id: tool
+        run: python3 .github/aot/aot_aotopsy.py tool
+      - name: Prepare go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: aotopsy/go.mod
+          cache: false
+      - name: Cache build
+        uses: actions/cache@v4
+        with:
+          path: aotopsy-bin
+          key: aotopsy-${{ steps.tool.outputs.commit }}
+      - name: Build
+        run: test -f aotopsy-bin || python3 .github/aot/aot_aotopsy.py build
+      - name: Fetch
+        run: python3 .github/aot/aot_aotopsy.py fetch
+      - name: Run
+        run: python3 .github/aot/aot_aotopsy.py run
+      - name: Pack
+        run: python3 .github/aot/aot_aotopsy.py pack
+      - name: Report failure
+        if: ${{ failure() }}
+        run: python3 .github/aot/aot_aotopsy.py fail
